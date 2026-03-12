@@ -1,0 +1,602 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+
+%labels
+    Author        YourName
+    Version       7.0.0
+    Description   Apptainer container for YOLO training. Ships YOLOv11 weights
+                  (all 5 sizes) baked in. Pinned deps for PyTorch 2.2 / CUDA 12.1.
+
+# ─────────────────────────────────────────────────────────────
+# BUILD STEPS
+# ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# SETUP  (runs on HOST before %post — used to pre-seed apt config)
+# ─────────────────────────────────────────────────────────────
+%setup
+    # Pre-seed the apt sandbox fix BEFORE %post runs.
+    # This is necessary when --fakeroot is unavailable (user not in
+    # /etc/subuid) and Apptainer falls back to root-mapped namespace.
+    # In that mode the %post shell cannot call setgroups, so apt's HTTP
+    # sandbox fails immediately. Writing the config here — via %setup
+    # which runs on the host with real filesystem access to the rootfs —
+    # ensures apt never tries to drop to the _apt user in the first place.
+    mkdir -p ${APPTAINER_ROOTFS}/etc/apt/apt.conf.d
+    echo 'APT::Sandbox::User "root";'         > ${APPTAINER_ROOTFS}/etc/apt/apt.conf.d/99sandbox-fix
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ── apt sandbox fix ──────────────────────────────────────
+    # APT::Sandbox::User "root" is pre-seeded via %setup above.
+    # Nothing to do here — apt will not try to drop privileges.
+
+    # ── System deps ──────────────────────────────────────────
+    # wget is NOT in the pytorch base image — install it first.
+    #
+    # libGL.so.1 fix:
+    #   pytorch:2.2.0-cuda12.1 is Ubuntu 20.04. Here "libgl1" is a
+    #   transitional meta-package with no files. The real provider of
+    #   libGL.so.1 is libgl1-mesa-glx. Without it "import cv2" raises:
+    #     ImportError: libGL.so.1: cannot open shared object file
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        wget \
+        curl \
+        git \
+        unzip \
+        ffmpeg \
+        libgl1-mesa-glx \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxrender1 \
+        libxext6 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    # Refresh the dynamic linker cache so libGL.so.1 is found immediately
+    ldconfig
+
+    # Verify libGL.so.1 is resolvable before wasting time on pip installs
+    ldconfig -p | grep libGL || { echo "[ERROR] libGL.so.1 not found — aborting."; exit 1; }
+
+    # ── Upgrade pip / setuptools / wheel ─────────────────────
+    pip install --no-cache-dir "pip==24.0" "setuptools==69.5.1" "wheel==0.43.0"
+
+    # ── Pinned Python packages ────────────────────────────────
+    #
+    # WHY THESE VERSIONS
+    # ──────────────────
+    # numpy 1.26.4
+    #   NumPy 2.0 broke the binary C API used by torch 2.2, older opencv,
+    #   and scipy. 1.26.x is the last stable 1.x series and the correct
+    #   choice for the entire torch 2.2 ecosystem.
+    #
+    # opencv-python-headless 4.9.0.80
+    #   • Last opencv release that declares numpy>=1.21.2 (not >=2.0).
+    #     opencv 4.10+ bumped its numpy floor to >=2.0, which would
+    #     conflict with torch 2.2's requirement for numpy <2.0.
+    #   • headless variant: no Qt/X11 GUI libs — correct for HPC/Docker.
+    #   • NOTE: roboflow is intentionally NOT installed here.
+    #     roboflow hard-depends on opencv-python (the GUI variant), which
+    #     shares the cv2 namespace with opencv-python-headless. pip cannot
+    #     install both simultaneously. roboflow is also a cloud API client
+    #     that requires internet + a Roboflow account at runtime, making it
+    #     unsuitable for air-gapped HPC compute nodes. Dataset downloads
+    #     should be done on a login node before submitting the training job.
+    #
+    # ultralytics 8.3.40
+    #   First stable release with full YOLO11 support.
+    #
+    # Pillow 10.3.0
+    #   Last release before 10.4 API changes; safe with torchvision 0.17.
+    #
+    # pandas 2.2.2
+    #   Last release before the pandas 3.0 API break; used by ultralytics
+    #   for results logging (results.csv).
+    #
+    # scipy 1.13.1
+    #   Last release compatible with numpy 1.x; used by ultralytics for
+    #   some augmentation operations.
+    #
+    # matplotlib 3.8.4 / seaborn 0.13.2
+    #   Pinned to versions whose transitive deps do not pull in numpy>=2.0.
+    #
+    # tensorboard 2.16.2
+    #   Compatible with protobuf <5; later releases require protobuf>=5
+    #   which can conflict with ultralytics' grpcio dependency.
+    #
+    # tqdm / psutil / py-cpuinfo
+    #   Utility packages; pinned to well-tested recent point releases.
+
+    pip install --no-cache-dir \
+        "numpy==1.26.4" \
+        "opencv-python-headless==4.9.0.80" \
+        "ultralytics==8.3.40" \
+        "PyYAML==6.0.1" \
+        "Pillow==10.3.0" \
+        "matplotlib==3.8.4" \
+        "seaborn==0.13.2" \
+        "pandas==2.2.2" \
+        "scipy==1.13.1" \
+        "tensorboard==2.16.2" \
+        "tqdm==4.66.4" \
+        "psutil==5.9.8" \
+        "py-cpuinfo==9.0.0"
+
+    # ── Smoke-test all critical imports ───────────────────────
+    python3 -c "
+import torch, ultralytics, cv2, numpy, yaml, PIL, matplotlib, pandas, scipy, tensorboard
+print('')
+print('=== Dependency smoke-test ===')
+print(f'  torch              {torch.__version__}')
+print(f'  ultralytics        {ultralytics.__version__}')
+print(f'  opencv (headless)  {cv2.__version__}')
+print(f'  numpy              {numpy.__version__}')
+print(f'  Pillow             {PIL.__version__}')
+print(f'  matplotlib         {matplotlib.__version__}')
+print(f'  pandas             {pandas.__version__}')
+print(f'  scipy              {scipy.__version__}')
+print(f'  tensorboard        {tensorboard.__version__}')
+print('=== All imports OK ===')
+print('')
+"
+
+    # ── Download ALL YOLOv11 weights at build time ────────────
+    # Baked into the image → no internet needed on compute nodes.
+    mkdir -p /opt/yolo_weights
+    WEIGHTS_URL="https://github.com/ultralytics/assets/releases/download/v8.3.0"
+    for SIZE in n s m l x; do
+        echo "[BUILD] Downloading yolo11${SIZE}.pt ..."
+        wget -q --show-progress \
+            -O "/opt/yolo_weights/yolo11${SIZE}.pt" \
+            "${WEIGHTS_URL}/yolo11${SIZE}.pt"
+    done
+    echo "[BUILD] Weights inventory:"
+    ls -lh /opt/yolo_weights/
+
+    # NOTE: /opt/yolo_weights/custom.pt does NOT exist in the image.
+    # It only appears when the user bind-mounts their own .pt file
+    # to that exact path at runtime (see %help for details).
+
+    # ── Training entry-point script ──────────────────────────
+    cat > /opt/train_yolo.sh << 'TRAIN_SCRIPT'
+#!/usr/bin/env bash
+# =============================================================
+#  YOLO Training Entry Point
+#  Usage: apptainer run [--nv] yolo_train.sif [OPTIONS]
+#  Run with --help for full option list.
+# =============================================================
+set -euo pipefail
+
+WEIGHTS_DIR="/opt/yolo_weights"
+CUSTOM_WEIGHT="${WEIGHTS_DIR}/custom.pt"   # override sentinel (bind-mount target)
+
+# ── Defaults ─────────────────────────────────────────────────
+YOLO_SIZE="n"        # YOLOv11 size: n s m l x  (default: yolo11n)
+DATA_PATH=""
+CLASSES=""
+OUTPUT_DIR="/output"
+EPOCHS=100
+BATCH=16
+IMG_SIZE=640
+WORKERS=8
+LR0=0.01
+LRF=0.01
+MOMENTUM=0.937
+WEIGHT_DECAY=0.0005
+PATIENCE=50
+DEVICE="0"
+PROJECT_NAME="yolo_train"
+RUN_NAME="exp"
+RESUME=false
+EXTRA_ARGS=""
+
+# ── Help ─────────────────────────────────────────────────────
+usage() {
+cat << EOF
+=================================================================
+ YOLO Training Container  |  Default: YOLOv11n  (baked into image)
+=================================================================
+
+REQUIRED
+  --data PATH       Dataset root directory  OR  path to a .yaml file.
+                    Directory layout expected:
+                      <PATH>/
+                        images/  train/  val/  (test/ optional)
+                        labels/  train/  val/
+  --classes NAMES   Comma-separated class names, e.g. "cat,dog,car"
+                    Skip this when --data already points to a .yaml.
+
+-----------------------------------------------------------------
+ MODEL WEIGHTS  --  two modes, mutually exclusive
+-----------------------------------------------------------------
+
+  MODE 1 (default) · Built-in YOLOv11 weights
+    All five sizes are downloaded at BUILD TIME and live inside
+    the .sif image. No internet is required on compute nodes.
+
+    --variant SIZE    n | s | m | l | x         [default: n]
+                      n  yolo11n  ~5 MB   fastest / least accurate
+                      s  yolo11s  ~19 MB
+                      m  yolo11m  ~38 MB  good balance
+                      l  yolo11l  ~49 MB
+                      x  yolo11x  ~109 MB slowest / most accurate
+
+  MODE 2 · Your own .pt file  (bind-mount override)
+    Bind your model to the FIXED SENTINEL PATH:
+      /opt/yolo_weights/custom.pt
+
+    When that file is present, --variant is IGNORED and your
+    model is used instead. Compatible with any Ultralytics .pt:
+      • YOLOv8 / v9 / v10 / v11 pretrained weights
+      • A partial checkpoint you want to resume or fine-tune
+      • A model already trained on other data / classes
+
+    Bind syntax:
+      --bind /host/path/to/my_model.pt:/opt/yolo_weights/custom.pt
+
+-----------------------------------------------------------------
+ TRAINING HYPERPARAMETERS
+-----------------------------------------------------------------
+  --epochs N        Training epochs              [default: 100]
+  --batch N         Batch size                   [default: 16]
+  --img-size N      Input resolution (pixels)    [default: 640]
+  --workers N       DataLoader workers           [default: 8]
+  --device ID       GPU id(s) or 'cpu'           [default: 0]
+                    Multi-GPU example: --device 0,1,2,3
+  --patience N      Early-stopping patience      [default: 50]
+  --lr0 FLOAT       Initial learning rate        [default: 0.01]
+  --lrf FLOAT       Final LR (fraction of lr0)   [default: 0.01]
+  --momentum FLOAT  SGD momentum                 [default: 0.937]
+  --weight-decay F  Optimizer weight decay       [default: 0.0005]
+  --resume          Resume training from last checkpoint
+
+-----------------------------------------------------------------
+ OUTPUT
+-----------------------------------------------------------------
+  --output PATH     Output directory inside container [default: /output]
+                    Bind your host path:
+                      --bind /host/results:/output
+  --project NAME    Sub-folder name              [default: yolo_train]
+  --run NAME        Experiment name              [default: exp]
+                    Trained weights land at:
+                      <output>/<project>/<run>/weights/best.pt
+                      <output>/<project>/<run>/weights/last.pt
+
+-----------------------------------------------------------------
+ MISC
+-----------------------------------------------------------------
+  --extra "..."     Extra Ultralytics CLI args passed verbatim
+                    e.g. --extra "augment=True cos_lr=True"
+  --help / -h       Show this help and exit
+
+=================================================================
+ QUICK-START EXAMPLES
+
+ # Built-in yolo11m, directory dataset:
+ apptainer run --nv \
+   --bind /data:/data --bind /results:/output \
+   yolo_train.sif \
+   --variant m --data /data --classes "cat,dog,car" \
+   --epochs 100 --batch 32 --device 0
+
+ # Built-in yolo11l, ready-made dataset.yaml:
+ apptainer run --nv \
+   --bind /data:/data --bind /results:/output \
+   yolo_train.sif \
+   --variant l --data /data/dataset.yaml \
+   --epochs 200 --batch 8
+
+ # YOUR OWN .pt file (overrides built-in weights):
+ apptainer run --nv \
+   --bind /models/my_yolo.pt:/opt/yolo_weights/custom.pt \
+   --bind /data:/data --bind /results:/output \
+   yolo_train.sif \
+   --data /data --classes "cat,dog,car" \
+   --epochs 50 --batch 16
+
+ # CPU-only (no --nv):
+ apptainer run \
+   --bind /data:/data --bind /results:/output \
+   yolo_train.sif \
+   --variant n --data /data --classes "person" \
+   --device cpu
+
+ # Multi-GPU:
+ apptainer run --nv \
+   --bind /data:/data --bind /results:/output \
+   yolo_train.sif \
+   --variant x --data /data/dataset.yaml \
+   --device 0,1,2,3 --batch 64
+=================================================================
+EOF
+exit 0
+}
+
+# ── Argument parsing ─────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --variant)       YOLO_SIZE="$2";      shift 2 ;;
+    --data)          DATA_PATH="$2";      shift 2 ;;
+    --classes)       CLASSES="$2";        shift 2 ;;
+    --output)        OUTPUT_DIR="$2";     shift 2 ;;
+    --epochs)        EPOCHS="$2";         shift 2 ;;
+    --batch)         BATCH="$2";          shift 2 ;;
+    --img-size)      IMG_SIZE="$2";       shift 2 ;;
+    --workers)       WORKERS="$2";        shift 2 ;;
+    --lr0)           LR0="$2";            shift 2 ;;
+    --lrf)           LRF="$2";            shift 2 ;;
+    --momentum)      MOMENTUM="$2";       shift 2 ;;
+    --weight-decay)  WEIGHT_DECAY="$2";   shift 2 ;;
+    --patience)      PATIENCE="$2";       shift 2 ;;
+    --device)        DEVICE="$2";         shift 2 ;;
+    --project)       PROJECT_NAME="$2";   shift 2 ;;
+    --run)           RUN_NAME="$2";       shift 2 ;;
+    --extra)         EXTRA_ARGS="$2";     shift 2 ;;
+    --resume)        RESUME=true;         shift   ;;
+    --help|-h)       usage ;;
+    *) echo "[ERROR] Unknown argument: $1"; echo "Run with --help for usage."; exit 1 ;;
+  esac
+done
+
+# ── Validate required args ────────────────────────────────────
+[[ -z "$DATA_PATH" ]] && { echo "[ERROR] --data is required."; echo "Run with --help for usage."; exit 1; }
+mkdir -p "$OUTPUT_DIR"
+
+# ── Resolve model weights ─────────────────────────────────────
+if [[ -f "$CUSTOM_WEIGHT" ]]; then
+    MODEL_ARG="$CUSTOM_WEIGHT"
+    echo "[INFO] *** Custom weight detected at ${CUSTOM_WEIGHT} ***"
+    echo "[INFO]     Using YOUR model: ${MODEL_ARG}"
+    echo "[INFO]     (--variant is ignored when custom.pt is present)"
+else
+    SIZE=$(echo "$YOLO_SIZE" | tr '[:upper:]' '[:lower:]')
+    SIZE="${SIZE##yolo11}"
+    SIZE="${SIZE##yolov11}"
+    case "$SIZE" in
+        n|s|m|l|x) ;;
+        *) echo "[ERROR] --variant '${YOLO_SIZE}' is not valid."; \
+           echo "        Use one of: n  s  m  l  x  (or yolo11n … yolo11x)"; exit 1 ;;
+    esac
+    MODEL_ARG="${WEIGHTS_DIR}/yolo11${SIZE}.pt"
+    echo "[INFO] Using built-in YOLOv11${SIZE} weights: ${MODEL_ARG}"
+    echo "[INFO] (To use your own model, bind it to ${CUSTOM_WEIGHT})"
+fi
+
+# ── Build / locate dataset YAML ──────────────────────────────
+if [[ "$DATA_PATH" == *.yaml || "$DATA_PATH" == *.yml ]]; then
+    DATASET_YAML="$DATA_PATH"
+    echo "[INFO] Using provided dataset YAML: $DATASET_YAML"
+else
+    [[ -z "$CLASSES" ]] && {
+        echo "[ERROR] --classes is required when --data is a directory (not a .yaml).";
+        exit 1;
+    }
+    DATASET_YAML="$OUTPUT_DIR/dataset.yaml"
+    echo "[INFO] Generating dataset YAML → $DATASET_YAML"
+
+    IFS=',' read -ra CLASS_ARRAY <<< "$CLASSES"
+    NC=${#CLASS_ARRAY[@]}
+    NAMES_LIST=$(python3 -c "
+import sys
+classes = sys.argv[1].split(',')
+print('[' + ', '.join(repr(c.strip()) for c in classes) + ']')
+" "$CLASSES")
+
+    cat > "$DATASET_YAML" << YAML
+# Auto-generated by yolo_train container
+path: ${DATA_PATH}
+train: images/train
+val:   images/val
+# test: images/test   # uncomment if you have a test split
+
+nc: ${NC}
+names: ${NAMES_LIST}
+YAML
+    echo "[INFO] dataset.yaml:"
+    cat "$DATASET_YAML"
+fi
+
+# ── Training summary ─────────────────────────────────────────
+echo ""
+echo "================================================================="
+echo "  YOLO Training Summary"
+echo "================================================================="
+echo "  Weights      : $MODEL_ARG"
+echo "  Dataset YAML : $DATASET_YAML"
+echo "  Epochs       : $EPOCHS  |  Batch: $BATCH  |  Img size: $IMG_SIZE"
+echo "  Device       : $DEVICE  |  Workers: $WORKERS"
+echo "  LR0: $LR0  LRF: $LRF  Momentum: $MOMENTUM  WD: $WEIGHT_DECAY"
+echo "  Early-stop patience : $PATIENCE"
+echo "  Output       : $OUTPUT_DIR/$PROJECT_NAME/$RUN_NAME"
+echo "================================================================="
+echo ""
+
+# ── Resume flag ───────────────────────────────────────────────
+RESUME_FLAG=""
+$RESUME && RESUME_FLAG="resume=True"
+
+# ── Launch training ───────────────────────────────────────────
+yolo detect train \
+    model="$MODEL_ARG" \
+    data="$DATASET_YAML" \
+    epochs="$EPOCHS" \
+    batch="$BATCH" \
+    imgsz="$IMG_SIZE" \
+    workers="$WORKERS" \
+    lr0="$LR0" \
+    lrf="$LRF" \
+    momentum="$MOMENTUM" \
+    weight_decay="$WEIGHT_DECAY" \
+    patience="$PATIENCE" \
+    device="$DEVICE" \
+    project="$OUTPUT_DIR/$PROJECT_NAME" \
+    name="$RUN_NAME" \
+    $RESUME_FLAG \
+    $EXTRA_ARGS
+
+echo ""
+echo "[INFO] Training complete."
+echo "[INFO]   Best weights : $OUTPUT_DIR/$PROJECT_NAME/$RUN_NAME/weights/best.pt"
+echo "[INFO]   Last weights : $OUTPUT_DIR/$PROJECT_NAME/$RUN_NAME/weights/last.pt"
+TRAIN_SCRIPT
+
+    chmod +x /opt/train_yolo.sh
+
+# ─────────────────────────────────────────────────────────────
+# ENVIRONMENT
+# ─────────────────────────────────────────────────────────────
+%environment
+    export PATH=/opt/conda/bin:$PATH
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    export YOLO_TELEMETRY=False
+    # Writable config dir so the SIF image can stay read-only
+    export YOLO_CONFIG_DIR=/tmp/ultralytics
+
+# ─────────────────────────────────────────────────────────────
+# STARTUP  (runs before %runscript each time)
+# ─────────────────────────────────────────────────────────────
+%startscript
+    mkdir -p /tmp/ultralytics
+
+# ─────────────────────────────────────────────────────────────
+# DEFAULT RUN ACTION
+# ─────────────────────────────────────────────────────────────
+%runscript
+    exec /opt/train_yolo.sh "$@"
+
+# ─────────────────────────────────────────────────────────────
+# HELP TEXT   apptainer run-help yolo_train.sif
+# ─────────────────────────────────────────────────────────────
+%help
+    =================================================================
+     YOLO Training Container  v4
+     Default model : YOLOv11n  (all 5 YOLOv11 sizes baked into image)
+     Backend       : Ultralytics 8.3.40  |  PyTorch 2.2.0  |  CUDA 12.1
+     No internet needed at runtime.
+    =================================================================
+
+    BUILD  (requires internet once)
+      apptainer build yolo_train.sif yolo_train.def
+      Downloads yolo11n/s/m/l/x.pt into the image during build.
+      After that the .sif is fully self-contained.
+
+    PINNED DEPENDENCY STACK
+      torch                2.2.0     (from base image)
+      ultralytics          8.3.40    (YOLO11 support)
+      numpy                1.26.4    (<2.0 required by torch 2.2 + opencv 4.9)
+      opencv-headless      4.9.0.80  (numpy <2.0 compatible; no GUI libs)
+      Pillow               10.3.0
+      PyYAML               6.0.1
+      matplotlib           3.8.4
+      seaborn              0.13.2
+      pandas               2.2.2
+      scipy                1.13.1
+      tensorboard          2.16.2
+      tqdm                 4.66.4
+
+    NOTE — roboflow is intentionally excluded
+      roboflow hard-depends on opencv-python (GUI variant), which
+      conflicts with opencv-python-headless (they share the cv2
+      namespace — pip cannot install both). roboflow is also a cloud
+      API client that needs internet + a Roboflow account at runtime,
+      making it unsuitable for air-gapped HPC nodes. Download your
+      dataset on a login node before submitting the training job.
+
+    CUDA COMPATIBILITY
+      Minimum host driver : 525.60  (supports CUDA 12.1)
+      Compatible with host drivers for CUDA 12.1 through 12.4+
+
+    -----------------------------------------------------------------
+     WEIGHTS: TWO MODES
+    -----------------------------------------------------------------
+
+    MODE 1 (DEFAULT) · Built-in YOLOv11 weights
+      All five sizes live inside the image. Pick one with --variant:
+
+        --variant n   yolo11n  ~5 MB   fastest / lowest accuracy
+        --variant s   yolo11s  ~19 MB
+        --variant m   yolo11m  ~38 MB  good everyday balance
+        --variant l   yolo11l  ~49 MB
+        --variant x   yolo11x  ~109 MB slowest / highest accuracy
+
+      Full name also accepted: --variant yolo11m
+
+      Example:
+        apptainer run --nv \
+          --bind /data:/data --bind /results:/output \
+          yolo_train.sif \
+          --variant m --data /data --classes "cat,dog,car" \
+          --epochs 100 --batch 32
+
+    MODE 2 · Your own .pt file  (bind-mount to override)
+      Bind your file to this EXACT path inside the container:
+        /opt/yolo_weights/custom.pt
+
+      That path does not exist in the image by default.
+      As soon as you bind a file there, the container detects it
+      and uses IT instead of any built-in weight. --variant is
+      silently ignored in this mode.
+
+      Works with any Ultralytics-compatible .pt:
+        • YOLOv8 / v9 / v10 / v11 pretrained weights
+        • A partially trained checkpoint to resume/fine-tune
+        • A model trained on different classes you want to adapt
+
+      Example:
+        apptainer run --nv \
+          --bind /models/my_model.pt:/opt/yolo_weights/custom.pt \
+          --bind /data:/data --bind /results:/output \
+          yolo_train.sif \
+          --data /data --classes "cat,dog,car" \
+          --epochs 50 --batch 16
+
+    -----------------------------------------------------------------
+     MORE EXAMPLES
+    -----------------------------------------------------------------
+
+    Ready-made dataset.yaml (skip --classes):
+      apptainer run --nv \
+        --bind /data:/data --bind /results:/output \
+        yolo_train.sif \
+        --variant l --data /data/dataset.yaml \
+        --epochs 200 --batch 8
+
+    CPU-only (no --nv):
+      apptainer run \
+        --bind /data:/data --bind /results:/output \
+        yolo_train.sif \
+        --variant n --data /data \
+        --classes "person,bicycle" \
+        --device cpu
+
+    Multi-GPU:
+      apptainer run --nv \
+        --bind /data:/data --bind /results:/output \
+        yolo_train.sif \
+        --variant x --data /data/dataset.yaml \
+        --device 0,1,2,3 --batch 64
+
+    Extra Ultralytics args:
+      ... yolo_train.sif \
+        --variant m --data /data --classes "cat" \
+        --extra "augment=True cos_lr=True"
+
+    -----------------------------------------------------------------
+     OUTPUT STRUCTURE
+    -----------------------------------------------------------------
+      /output/
+        yolo_train/
+          exp/
+            weights/
+              best.pt   <-- best checkpoint  (use this)
+              last.pt   <-- last checkpoint
+            results.csv / results.png
+            confusion_matrix.png
+            val_batch*.jpg / train_batch*.jpg
+
+    Full CLI option list:
+      apptainer run yolo_train.sif --help

@@ -1,0 +1,230 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    Author CDAC
+    Version 1.0
+    Description Lightweight TensorFlow Deep Learning Environment - Python 3.11, CUDA 12.2, Essential DL Stack
+
+%help
+    Lightweight container for TensorFlow deep learning model development.
+    Includes only essential libraries: TensorFlow, CUDA, basic data science tools.
+    
+    Usage:
+    apptainer shell --nv tensorflow_dl.sif
+    apptainer exec --nv tensorflow_dl.sif python train.py
+    apptainer exec --nv tensorflow_dl.sif jupyter lab --ip=0.0.0.0 --port=8888 --allow-root
+
+%environment
+    export CUDA_HOME=/usr/local/cuda
+    export PATH=/usr/local/cuda/bin:$PATH
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+    export PATH="/opt/miniconda/bin:$PATH"
+    export CONDA_DEFAULT_ENV=base
+    export CONDA_PREFIX=/opt/miniconda
+    export PYTHONPATH=/opt/miniconda/lib/python3.11/site-packages:$PYTHONPATH
+    # TensorFlow specific settings
+    export TF_CPP_MIN_LOG_LEVEL=3
+    export TF_ENABLE_ONEDNN_OPTS=0
+    export TF_FORCE_GPU_ALLOW_GROWTH=true
+    export CUDA_VISIBLE_DEVICES=""
+    # Cache settings
+    export PIP_CACHE_DIR=/tmp/pip
+    export KERAS_HOME=/tmp/keras
+    export MPLCONFIGDIR=/tmp/matplotlib
+    export TOKENIZERS_PARALLELISM=false
+
+%post
+    # Set non-interactive mode
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=UTC
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+    # Install minimal system dependencies
+    apt-get update && apt-get install -yqq \
+        build-essential \
+        cmake \
+        git \
+        wget \
+        curl \
+        vim \
+        python3 \
+        python3-dev \
+        python3-pip \
+        pkg-config \
+        ca-certificates \
+        libhdf5-dev \
+        libhdf5-serial-dev \
+        pkg-config && \
+    apt-get autoremove -yqq && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+    # Install Miniconda (minimal)
+    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
+    bash /tmp/miniconda.sh -b -p /opt/miniconda
+    rm /tmp/miniconda.sh
+
+    # Set conda path
+    export PATH="/opt/miniconda/bin:$PATH"
+
+    # Update conda and install minimal packages
+    /opt/miniconda/bin/conda update -n base -c defaults conda -y
+    /opt/miniconda/bin/conda install -n base -c conda-forge python=3.11 \
+        numpy \
+        matplotlib \
+        jupyter \
+        jupyterlab \
+        ipython \
+        ipykernel \
+        pillow \
+        h5py -y
+
+    # Upgrade pip
+    /opt/miniconda/bin/pip install --upgrade pip setuptools wheel --root-user-action=ignore
+
+    # Install TensorFlow with GPU support (essential)
+    /opt/miniconda/bin/pip install --no-cache-dir --root-user-action=ignore \
+        tensorflow[and-cuda] \
+        tf-keras
+
+    # Install essential TensorFlow ecosystem packages
+    /opt/miniconda/bin/pip install --no-cache-dir --root-user-action=ignore \
+        tensorflow-datasets \
+        tensorflow-probability[tf] \
+        keras-tuner \
+        pandas \
+        scikit-learn \
+        seaborn \
+        tqdm \
+        tensorboard \
+        opencv-python-headless
+
+    # Setup Jupyter kernel
+    /opt/miniconda/bin/python -m ipykernel install --user --name base --display-name "TensorFlow DL (Python 3.11)"
+
+    # Create cache directories
+    mkdir -p /tmp/pip /tmp/keras /tmp/matplotlib /tmp/tensorflow_datasets
+    chmod -R 777 /tmp/pip /tmp/keras /tmp/matplotlib /tmp/tensorflow_datasets
+
+    # Cleanup
+    /opt/miniconda/bin/conda clean --all -y
+    /opt/miniconda/bin/pip cache purge
+
+    echo "🔥 Lightweight TensorFlow DL Container Ready!"
+
+%runscript
+    export PATH="/opt/miniconda/bin:$PATH"
+    export CONDA_DEFAULT_ENV=base
+    export CONDA_PREFIX=/opt/miniconda
+
+    echo "=========================================="
+    echo "🔥 TensorFlow Deep Learning Container"
+    echo "=========================================="
+    echo ""
+    echo "🚀 Environment: Python 3.11 + TensorFlow + CUDA"
+    echo "💡 Lightweight & Extensible"
+    echo ""
+    echo "📦 Included Essentials:"
+    echo "  • TensorFlow (with GPU support)"
+    echo "  • TensorFlow Datasets & Probability"
+    echo "  • Keras Tuner (hyperparameter tuning)"
+    echo "  • Data: NumPy, Pandas, Scikit-learn"
+    echo "  • CV: OpenCV (headless)"
+    echo "  • Viz: Matplotlib, Seaborn"
+    echo "  • Dev: Jupyter Lab, TensorBoard"
+    echo ""
+    echo "🛠️  Add more as needed:"
+    echo "  pip install transformers     # For transformer models"
+    echo "  pip install tf-keras-vis     # For model visualization"
+    echo "  pip install wandb           # For experiment tracking"
+    echo "  pip install optuna          # For hyperparameter optimization"
+    echo ""
+
+    exec "$@"
+
+%test
+    export PATH="/opt/miniconda/bin:$PATH"
+    export CONDA_DEFAULT_ENV=base
+    export CONDA_PREFIX=/opt/miniconda
+
+    echo "🧪 Testing Lightweight TensorFlow Container..."
+
+    # Test Python
+    /opt/miniconda/bin/python -c "import sys; print(f'✅ Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" || exit 1
+
+    # Test TensorFlow and GPU
+    /opt/miniconda/bin/python -c "
+import tensorflow as tf
+print(f'✅ TensorFlow version: {tf.__version__}')
+print(f'✅ Keras version: {tf.keras.__version__}')
+
+# Check GPU availability
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f'✅ GPU available: {len(gpus)} device(s)')
+    for i, gpu in enumerate(gpus):
+        print(f'   GPU {i}: {gpu.name}')
+else:
+    print('⚠️  No GPU detected (OK for CPU testing)')
+
+# Check CUDA build
+if tf.test.is_built_with_cuda():
+    print('✅ TensorFlow built with CUDA support')
+else:
+    print('⚠️  TensorFlow not built with CUDA')
+" || exit 1
+
+    # Test essential imports
+    /opt/miniconda/bin/python -c "
+import tensorflow as tf
+import tensorflow_datasets as tfds
+import tensorflow_probability as tfp
+import keras_tuner as kt
+import numpy, pandas, matplotlib, sklearn
+import cv2, seaborn, tqdm
+print('✅ All essential TensorFlow libraries working')
+" || exit 1
+
+    # Test model creation (cleaner version)
+    /opt/miniconda/bin/python -c "
+import tensorflow as tf
+
+# Basic tensor operations
+x = tf.random.normal([3, 3])
+y = tf.matmul(x, x)
+print(f'✅ TensorFlow operations: {x.shape} -> {y.shape}')
+
+# Test if GPU operations work
+if tf.config.list_physical_devices('GPU'):
+    with tf.device('/GPU:0'):
+        x_gpu = tf.random.normal([3, 3])
+        y_gpu = tf.matmul(x_gpu, x_gpu)
+        print('✅ GPU operations working')
+
+# Test model creation (cleaner way)
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(5,)),
+    tf.keras.layers.Dense(10, activation='relu'),
+    tf.keras.layers.Dense(1)
+])
+model.compile(optimizer='adam', loss='mse')
+print('✅ Keras model creation working')
+" || exit 1
+
+    # Test TensorFlow Datasets (simpler test)
+    /opt/miniconda/bin/python -c "
+import tensorflow_datasets as tfds
+
+# Test dataset info access
+try:
+    builder = tfds.builder('mnist')
+    print('✅ TensorFlow Datasets working - MNIST builder available')
+    print('   (Datasets will be downloaded on first use)')
+except Exception as e:
+    print(f'⚠️  TensorFlow Datasets test skipped: {str(e)[:50]}...')
+" || exit 1
+
+    echo ""
+    echo "🎉 All tests passed! TensorFlow container ready."
+    echo "📊 Container optimized for TensorFlow deep learning development."

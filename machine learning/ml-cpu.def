@@ -1,0 +1,408 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    Author CDAC
+    Version 3.0
+    Description Base ML Container with Python 3.11 and comprehensive CPU ML/Analytics stack
+
+%help
+    This container provides a complete CPU-based ML environment for data science workflows.
+    Includes all major ML libraries, data processing tools, and visualization frameworks.
+
+    Usage:
+    apptainer shell ml_base.sif
+    apptainer exec ml_base.sif python your_script.py
+    apptainer exec ml_base.sif jupyter lab --ip=0.0.0.0 --port=8888 --allow-root
+
+%environment
+    export PATH="/opt/conda/bin:$PATH"
+    export CONDA_DEFAULT_ENV=base
+    export CONDA_PREFIX=/opt/conda
+    export PYTHONPATH="/opt/conda/lib/python3.11/site-packages:$PYTHONPATH"
+    export MPLCONFIGDIR=/tmp/matplotlib
+    export WANDB_CACHE_DIR=/tmp/wandb
+    export MLFLOW_TRACKING_URI=/tmp/mlruns
+    export NUMBA_CACHE_DIR=/tmp/numba
+    export FONTCONFIG_PATH=/etc/fonts
+    export FONTCONFIG_FILE=/etc/fonts/fonts.conf
+    export FC_CACHE_DIR=/tmp/fontconfig
+
+%post
+    # Set non-interactive mode
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=UTC
+
+    # Handle timezone
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+    echo ">>> Installing system dependencies..."
+    apt-get update && apt-get install -yqq \
+        build-essential \
+        cmake \
+        git \
+        wget \
+        curl \
+        vim \
+        nano \
+        htop \
+        tmux \
+        tree \
+        unzip \
+        zip \
+        rsync \
+        ca-certificates \
+        pkg-config \
+        libssl-dev \
+        libffi-dev \
+        libbz2-dev \
+        libreadline-dev \
+        libsqlite3-dev \
+        libgraphviz-dev \
+        graphviz \
+        sqlite3 \
+        postgresql-client \
+        libpq-dev \
+        python3 \
+        python3-dev \
+        python3-pip \
+        fontconfig \
+        fonts-dejavu-core \
+        fonts-liberation \
+        libfreetype6-dev \
+        libpng-dev \
+        libjpeg-dev && \
+        apt-get autoremove -yqq && \
+        apt-get clean && \
+        rm -rf /var/lib/apt/lists/*
+
+    echo ">>> Configuring fonts and cache directories..."
+    # Update font cache
+    fc-cache -fv
+    
+    # Create writable cache directories early
+    mkdir -p /tmp/matplotlib /tmp/wandb /tmp/mlruns /tmp/numba /tmp/dask /tmp/fontconfig
+    chmod -R 777 /tmp/matplotlib /tmp/wandb /tmp/mlruns /tmp/numba /tmp/dask /tmp/fontconfig
+
+    echo ">>> Installing Miniconda..."
+    wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
+    bash /tmp/miniconda.sh -b -p /opt/conda
+    rm /tmp/miniconda.sh
+
+    # Setup conda environment
+    export PATH="/opt/conda/bin:$PATH"
+    /opt/conda/bin/conda init bash
+    /opt/conda/bin/conda update -n base -c defaults conda -y
+    /opt/conda/bin/conda install -n base -c conda-forge mamba -y
+
+    echo ">>> Installing Python and core scientific libraries..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        python=3.11 \
+        numpy \
+        scipy \
+        pandas \
+        matplotlib \
+        seaborn \
+        plotly \
+        bokeh
+
+    echo ">>> Installing machine learning libraries..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        scikit-learn \
+        xgboost \
+        lightgbm \
+        catboost \
+        imbalanced-learn
+
+    echo ">>> Installing statistical and time-series libraries..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        statsmodels \
+        prophet
+
+    echo ">>> Installing hyperparameter optimization..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        optuna \
+        hyperopt \
+        scikit-optimize
+
+    echo ">>> Installing model interpretability..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        shap \
+        lime
+
+    echo ">>> Installing data processing libraries..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        polars \
+        pyarrow \
+        fastparquet \
+        openpyxl \
+        sqlalchemy \
+        psycopg2 \
+        pymongo \
+        requests \
+        beautifulsoup4
+
+    echo ">>> Installing distributed computing..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        dask \
+        joblib
+
+    echo ">>> Installing additional visualization..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        holoviews \
+        altair \
+        networkx \
+        pygraphviz
+
+    echo ">>> Installing MLOps and experiment tracking..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        mlflow \
+        wandb
+
+    echo ">>> Installing Jupyter ecosystem..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        jupyterlab \
+        ipywidgets \
+        voila \
+        notebook \
+        ipython \
+        ipykernel
+
+    echo ">>> Installing development tools..."
+    /opt/conda/bin/mamba install -n base --yes -c conda-forge \
+        black \
+        pytest \
+        tqdm \
+        rich
+
+    echo ">>> Installing additional packages via pip..."
+    /opt/conda/bin/pip install --no-cache-dir --root-user-action=ignore \
+        "ydata-profiling[notebook]" \
+        "feature-engine" \
+        "category_encoders" \
+        "mlxtend" \
+        "jupyterlab-git" \
+        "jupyter-lsp" \
+        "flaml" \
+        "evidently" \
+        "pandera" \
+        "dvc[all]" \
+        "prefect" \
+        "typer" \
+        "click" \
+        "pydantic" \
+        "httpx" \
+        "python-dotenv" \
+        "cloudpickle" \
+        "fsspec[s3]" \
+        "sktime" \
+        "statsforecast" \
+        "kaleido" \
+        "wordcloud" \
+        "textblob" \
+        "spacy" \
+        "gensim"
+
+    echo ">>> Setting up Jupyter kernel..."
+    /opt/conda/bin/python -m ipykernel install --user --name base --display-name "ML Base (Python 3.11)"
+
+    echo ">>> Final cleanup and configuration..."
+    /opt/conda/bin/conda clean --all -y
+    /opt/conda/bin/pip cache purge
+
+    # Ensure cache directories exist with proper permissions
+    mkdir -p /tmp/matplotlib /tmp/wandb /tmp/mlruns /tmp/numba /tmp/dask /tmp/fontconfig
+    chmod -R 777 /tmp/matplotlib /tmp/wandb /tmp/mlruns /tmp/numba /tmp/dask /tmp/fontconfig
+
+    # Configure matplotlib to use Agg backend by default (no display needed)
+    /opt/conda/bin/python -c "
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+print('✅ Matplotlib configured with Agg backend')
+print(f'✅ Available fonts: {len(fm.fontManager.ttflist)} fonts found')
+"
+
+    echo "🎉 Base ML Container Setup Complete!"
+
+%runscript
+    export PATH="/opt/conda/bin:$PATH"
+    export CONDA_DEFAULT_ENV=base
+    export CONDA_PREFIX=/opt/conda
+
+    echo "=========================================="
+    echo "🚀 Base ML Container Ready!"
+    echo "=========================================="
+    echo ""
+    echo "🔧 Environment: Python 3.11 with comprehensive ML stack"
+    echo "💾 Base: Ubuntu 22.04 + Miniconda3"
+    echo "🧠 ML Libraries: scikit-learn, XGBoost, LightGBM, CatBoost"
+    echo "📊 Data: Pandas, Polars, Dask, PyArrow"
+    echo "📈 Viz: Matplotlib, Seaborn, Plotly, Bokeh"
+    echo "🔬 MLOps: MLflow, Weights & Biases, Optuna"
+    echo ""
+    echo "📝 Quick start commands:"
+    echo "  • python: Start Python with ML libraries"
+    echo "  • jupyter lab: Launch Jupyter Lab"
+    echo "  • mlflow ui: Start MLflow tracking UI"
+    echo ""
+    echo "🔗 Usage examples:"
+    echo "  apptainer shell ml_base.sif"
+    echo "  apptainer exec ml_base.sif python your_script.py"
+    echo "  apptainer exec ml_base.sif jupyter lab --ip=0.0.0.0"
+    echo ""
+
+    exec "$@"
+
+%test
+    export PATH="/opt/conda/bin:$PATH"
+    export CONDA_DEFAULT_ENV=base
+    export CONDA_PREFIX=/opt/conda
+
+    echo "🧪 Testing Base ML Container..."
+
+    # Test Python environment
+    echo "Testing Python environment..."
+    /opt/conda/bin/python -c "
+import sys
+print(f'✅ Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')
+"
+
+    # Test core scientific libraries
+    echo "Testing core scientific libraries..."
+    /opt/conda/bin/python -c "
+import numpy as np
+import pandas as pd
+import scipy
+import matplotlib
+print(f'✅ NumPy: {np.__version__}')
+print(f'✅ Pandas: {pd.__version__}')
+print(f'✅ SciPy: {scipy.__version__}')
+print(f'✅ Matplotlib: {matplotlib.__version__}')
+"
+
+    # Test ML libraries
+    echo "Testing machine learning libraries..."
+    /opt/conda/bin/python -c "
+import sklearn
+import xgboost as xgb
+import lightgbm as lgb
+import catboost as cb
+print(f'✅ Scikit-learn: {sklearn.__version__}')
+print(f'✅ XGBoost: {xgb.__version__}')
+print(f'✅ LightGBM: {lgb.__version__}')
+print(f'✅ CatBoost: {cb.__version__}')
+"
+
+    # Test visualization libraries
+    echo "Testing visualization libraries..."
+    /opt/conda/bin/python -c "
+import os
+# Set matplotlib backend before importing pyplot
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly
+import bokeh
+
+print(f'✅ Matplotlib: {matplotlib.__version__} (backend: {matplotlib.get_backend()})')
+print(f'✅ Seaborn: {sns.__version__}')
+print(f'✅ Plotly: {plotly.__version__}')
+print(f'✅ Bokeh: {bokeh.__version__}')
+
+# Test basic plotting functionality
+fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+ax.plot([1, 2, 3, 4], [1, 4, 2, 3])
+ax.set_title('Test Plot')
+plt.savefig('/tmp/test_plot.png', dpi=72, bbox_inches='tight')
+plt.close()
+print('✅ Matplotlib plotting test successful')
+"
+
+    # Test MLOps tools
+    echo "Testing MLOps tools..."
+    /opt/conda/bin/python -c "
+import mlflow
+import wandb
+import optuna
+import shap
+print(f'✅ MLflow: {mlflow.__version__}')
+print(f'✅ Weights & Biases: {wandb.__version__}')
+print(f'✅ Optuna: {optuna.__version__}')
+print(f'✅ SHAP: {shap.__version__}')
+"
+
+    # Test data processing
+    echo "Testing data processing libraries..."
+    /opt/conda/bin/python -c "
+import polars as pl
+import pyarrow as pa
+import dask
+print(f'✅ Polars: {pl.__version__}')
+print(f'✅ PyArrow: {pa.__version__}')
+print(f'✅ Dask: {dask.__version__}')
+"
+
+    # Test basic ML workflow
+    echo "Testing complete ML workflow..."
+    /opt/conda/bin/python -c "
+import numpy as np
+import pandas as pd
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+import matplotlib.pyplot as plt
+
+# Generate synthetic data
+X, y = make_classification(n_samples=1000, n_features=20, n_classes=2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Train multiple models
+models = {
+    'RandomForest': RandomForestClassifier(n_estimators=50, random_state=42),
+}
+
+results = {}
+for name, model in models.items():
+    # Cross-validation
+    cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='accuracy')
+    
+    # Train and test
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    test_accuracy = accuracy_score(y_test, y_pred)
+    
+    results[name] = {
+        'cv_mean': cv_scores.mean(),
+        'cv_std': cv_scores.std(),
+        'test_accuracy': test_accuracy
+    }
+
+# Display results
+for name, metrics in results.items():
+    print(f'✅ {name}:')
+    print(f'   CV Accuracy: {metrics[\"cv_mean\"]:.3f} ± {metrics[\"cv_std\"]:.3f}')
+    print(f'   Test Accuracy: {metrics[\"test_accuracy\"]:.3f}')
+
+print('✅ Complete ML workflow test successful!')
+"
+
+    # Test Jupyter
+    echo "Testing Jupyter installation..."
+    /opt/conda/bin/jupyter --version
+
+    echo ""
+    echo "🎉 All tests passed! Base ML container is ready."
+    echo ""
+    echo "📦 Container includes:"
+    echo "  • Python 3.11 with optimized scientific stack"
+    echo "  • ML: scikit-learn, XGBoost, LightGBM, CatBoost"
+    echo "  • Stats: StatsModels, Prophet, SciPy"
+    echo "  • Data: Pandas, Polars, Dask, PyArrow"
+    echo "  • Viz: Matplotlib, Seaborn, Plotly, Bokeh"
+    echo "  • MLOps: MLflow, Weights & Biases, Optuna, SHAP"
+    echo "  • Dev: Jupyter Lab, Black, Pytest"
+    echo "  • Ready for: Classification, Regression, Time Series, NLP basics"

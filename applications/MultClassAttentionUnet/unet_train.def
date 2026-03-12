@@ -1,0 +1,390 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+%labels
+    Author        YourName
+    Version       1.0.0
+    Description   MultiClass Attention-UNet container.
+                  Supports single-GPU training, multi-GPU DDP (Accelerate),
+                  and Gradio-based retinal vessel visualization.
+                  Project code is baked in at /app/main.
+                  CUDA 12.4 / PyTorch 2.6.0 / cuDNN 9
+
+# ─────────────────────────────────────────────────────────────
+# SETUP  (runs on HOST — pre-seeds apt config before %post)
+# ─────────────────────────────────────────────────────────────
+%setup
+    # Pre-seed apt sandbox fix before %post.
+    # Required when --fakeroot is unavailable (user not in /etc/subuid).
+    # Without this, apt's HTTP method fails with:
+    #   "E: setgroups 65534 failed - Operation not permitted"
+    mkdir -p ${APPTAINER_ROOTFS}/etc/apt/apt.conf.d
+    echo 'APT::Sandbox::User "root";' \
+        > ${APPTAINER_ROOTFS}/etc/apt/apt.conf.d/99sandbox-fix
+
+    # Create app directory skeleton (files will be copied in %files)
+    mkdir -p ${APPTAINER_ROOTFS}/app/main/visualizers
+    mkdir -p ${APPTAINER_ROOTFS}/app/main/models
+    mkdir -p ${APPTAINER_ROOTFS}/model     # sentinel bind-mount target for user .pth
+    mkdir -p ${APPTAINER_ROOTFS}/data      # sentinel bind-mount for dataset
+    mkdir -p ${APPTAINER_ROOTFS}/output    # sentinel bind-mount for outputs
+
+# ─────────────────────────────────────────────────────────────
+# FILES  (copied from HOST build context into container)
+# ─────────────────────────────────────────────────────────────
+# HOW TO USE THIS SECTION:
+#   Place the following files in the SAME DIRECTORY as this .def file
+#   before running apptainer build:
+#
+#     unet_train.def            ← this file
+#     MultiClass_Attention_Unet_-_Rev.zip   ← project zip
+#     train_cli.py              ← CLI wrapper for single-GPU training
+#     train_ddp_cli.py          ← CLI wrapper for DDP training
+#     run_visualizer.sh         ← Gradio launcher
+#     unet_entrypoint.sh        ← main dispatcher
+#
+#   The zip is extracted in %post. All scripts are placed at /app/.
+%files
+    MultiClass_Attention_Unet_-_Rev.zip    /app/project.zip
+    train_cli.py                           /app/main/train_cli.py
+    train_ddp_cli.py                       /app/main/train_ddp_cli.py
+    run_visualizer.sh                      /app/run_visualizer.sh
+    unet_entrypoint.sh                     /app/unet_entrypoint.sh
+
+# ─────────────────────────────────────────────────────────────
+# BUILD STEPS
+# ─────────────────────────────────────────────────────────────
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ── System deps ──────────────────────────────────────────
+    # apt sandbox fix pre-seeded via %setup above (99sandbox-fix).
+    # libgl1-mesa-glx: real provider of libGL.so.1 on Ubuntu 22.04
+    #   (libgl1 is a transitional meta-package with no files).
+    #   Without it: ImportError: libGL.so.1: cannot open shared object file
+    # libglib2.0-0: provides libgthread-2.0.so.0, required by cv2
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        wget \
+        curl \
+        git \
+        unzip \
+        ffmpeg \
+        libgl1-mesa-glx \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxrender1 \
+        libxext6 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    # Refresh linker cache and verify libGL.so.1 is present
+    ldconfig
+    ldconfig -p | grep libGL || {
+        echo "[ERROR] libGL.so.1 not found after install — aborting."
+        exit 1
+    }
+
+    # ── Upgrade pip / setuptools / wheel ─────────────────────
+    pip install --no-cache-dir "pip==24.0" "setuptools==69.5.1" "wheel==0.43.0"
+
+    # ── Pinned Python packages ────────────────────────────────
+    #
+    # WHY THESE VERSIONS
+    # ──────────────────
+    # Base image is pytorch:2.6.0-cuda12.4 (Python 3.11, Ubuntu 22.04).
+    # torch 2.6.0 is compatible with numpy 2.x unlike torch 2.2.
+    #
+    # numpy 2.1.3
+    #   torch 2.6 ships with numpy 2.x support. Using the project's
+    #   requirements.txt version (2.3.x) but pinned to 2.1.3 which is
+    #   stable and well-tested with scipy/sklearn/opencv 4.x.
+    #
+    # opencv-python-headless 4.10.0.84
+    #   Latest 4.x with numpy 2.x support. headless = no Qt/X11 libs.
+    #   NOTE: NOT installing opencv-python (GUI variant) alongside this.
+    #         Both share the cv2 namespace — pip cannot install both.
+    #
+    # accelerate 1.2.0
+    #   Required by train_ddp_cli.py for multi-GPU. Matches project
+    #   requirements.txt major version.
+    #
+    # gradio 5.9.1
+    #   Stable release compatible with Python 3.11 and fastapi 0.115.
+    #   The project uses gradio 6.5.1 (from requirements.txt) but that
+    #   version has known install issues with some dependency trees.
+    #   5.9.1 is API-compatible for the features used in visualizer.py.
+    #
+    # albumentations 2.0.4
+    #   Pinned to stable; project requirements.txt has 2.0.8 but minor
+    #   version differences don't affect the API used in train_cli.py.
+    #
+    # scikit-image / scikit-learn / scipy
+    #   Used by vessel_analyzer.py for skeletonize and distance transforms.
+    #   Pinned to compatible stable releases.
+    #
+    # pandas 2.2.2 (NOT 3.0.0)
+    #   pandas 3.0 has breaking API changes. 2.2.2 is stable and sufficient.
+
+    pip install --no-cache-dir \
+        "numpy==2.1.3" \
+        "opencv-python-headless==4.10.0.84" \
+        "albumentations==2.0.4" \
+        "accelerate==1.2.0" \
+        "gradio==5.9.1" \
+        "scikit-image==0.24.0" \
+        "scikit-learn==1.5.2" \
+        "scipy==1.14.1" \
+        "matplotlib==3.9.3" \
+        "pandas==2.2.2" \
+        "Pillow==10.4.0" \
+        "tqdm==4.66.5" \
+        "PyYAML==6.0.2" \
+        "psutil==5.9.8"
+
+    # ── Smoke-test critical imports ───────────────────────────
+    python3 -c "
+import torch, cv2, numpy, albumentations, accelerate, sklearn, scipy, skimage, gradio
+print('')
+print('=== Dependency smoke-test ===')
+print(f'  torch              {torch.__version__}   cuda={torch.cuda.is_available()}')
+print(f'  numpy              {numpy.__version__}')
+print(f'  opencv (headless)  {cv2.__version__}')
+print(f'  albumentations     {albumentations.__version__}')
+print(f'  accelerate         {accelerate.__version__}')
+print(f'  scikit-learn       {sklearn.__version__}')
+print(f'  scikit-image       {skimage.__version__}')
+print(f'  scipy              {scipy.__version__}')
+print(f'  gradio             {gradio.__version__}')
+print('=== All imports OK ===')
+print('')
+"
+
+    # ── Extract project zip into /app ─────────────────────────
+    echo "[BUILD] Extracting project zip..."
+    cd /app
+    unzip -q /app/project.zip -d /tmp/project_extract
+
+    # The zip contains "MultiClass_Attention_Unet - Rev/" at the top level
+    # Find and copy the main/ directory into /app/main
+    PROJECT_DIR=$(find /tmp/project_extract -maxdepth 1 -type d | grep -v "^/tmp/project_extract$" | head -1)
+    echo "[BUILD] Found project dir: $PROJECT_DIR"
+
+    # Copy project source files into /app/main (preserving structure)
+    cp -r "$PROJECT_DIR/main/." /app/main/
+    # Copy samples for visualizer testing
+    cp -r "$PROJECT_DIR/samples" /app/samples 2>/dev/null || true
+    # Copy README
+    cp "$PROJECT_DIR/README.md" /app/README.md 2>/dev/null || true
+
+    rm -rf /tmp/project_extract /app/project.zip
+
+    echo "[BUILD] Project files installed:"
+    ls -lh /app/main/
+    echo ""
+    ls -lh /app/main/visualizers/
+
+    # ── Install CLI wrappers and entrypoint ───────────────────
+    chmod +x /app/run_visualizer.sh /app/unet_entrypoint.sh
+
+    # Create convenience symlinks so modes work as top-level commands
+    # e.g.:  apptainer exec unet.sif train --help
+    ln -sf /app/unet_entrypoint.sh /usr/local/bin/train
+    ln -sf /app/unet_entrypoint.sh /usr/local/bin/train_ddp
+    ln -sf /app/unet_entrypoint.sh /usr/local/bin/visualize
+
+    # ── Verify project imports ────────────────────────────────
+    cd /app/main
+    python3 -c "
+import sys
+sys.path.insert(0, '/app/main')
+from model   import build_unet
+from metrics import DiceCELoss
+from utils   import seeding, EarlyStopping
+print('[BUILD] Project imports OK — model, metrics, utils')
+model = build_unet(num_classes=5)
+print(f'[BUILD] build_unet(num_classes=5) instantiated OK')
+param_count = sum(p.numel() for p in model.parameters())
+print(f'[BUILD] Total parameters: {param_count:,}')
+"
+
+# ─────────────────────────────────────────────────────────────
+# ENVIRONMENT
+# ─────────────────────────────────────────────────────────────
+%environment
+    export PATH=/opt/conda/bin:/usr/local/bin:$PATH
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    # Suppress HuggingFace telemetry
+    export HF_HUB_DISABLE_TELEMETRY=1
+    export ACCELERATE_DISABLE_RICH=1
+    # Default model sentinel path (overridable at runtime via bind)
+    export UNET_CHECKPOINT_PATH="/model/checkpoint.pth"
+
+# ─────────────────────────────────────────────────────────────
+# STARTUP  (runs before %runscript each time)
+# ─────────────────────────────────────────────────────────────
+%startscript
+    mkdir -p /tmp/hf_cache
+    export HF_HOME=/tmp/hf_cache
+
+# ─────────────────────────────────────────────────────────────
+# DEFAULT RUN ACTION
+# ─────────────────────────────────────────────────────────────
+%runscript
+    exec /app/unet_entrypoint.sh "$@"
+
+# ─────────────────────────────────────────────────────────────
+# HELP   apptainer run-help unet.sif
+# ─────────────────────────────────────────────────────────────
+%help
+    =================================================================
+     MultiClass Attention-UNet Container
+     Modes  : train | train_ddp | visualize | bash
+     Stack  : PyTorch 2.6.0 | CUDA 12.4 | cuDNN 9 | Python 3.11
+     Project: MultiClass Attention-UNet baked in at /app/main
+    =================================================================
+
+    BUILD (run once, requires internet)
+      Place all files in the same directory:
+        unet_train.def
+        MultiClass_Attention_Unet_-_Rev.zip
+        train_cli.py
+        train_ddp_cli.py
+        run_visualizer.sh
+        unet_entrypoint.sh
+
+      Then build:
+        apptainer build --fakeroot unet.sif unet_train.def
+        # or without fakeroot if your cluster supports it:
+        apptainer build unet.sif unet_train.def
+
+    -----------------------------------------------------------------
+     DATASET LAYOUT REQUIRED
+    -----------------------------------------------------------------
+      <dataset_root>/
+        images/   *.png   ← input images
+        masks/    *.png   ← RGB segmentation masks
+
+      Default colormap (5 classes):
+        Class 0: [  0,  0,  0]  Background (black)
+        Class 1: [255,  0,  0]  Artery     (red)
+        Class 2: [  0,  0,255]  Vein       (blue)
+        Class 3: [  0,255,  0]  Junction   (green)
+        Class 4: [255,255,255]  Uncertain  (white)
+
+    -----------------------------------------------------------------
+     MODE 1: SINGLE-GPU TRAINING
+    -----------------------------------------------------------------
+      apptainer run --nv \
+        --bind /host/dataset:/data \
+        --bind /host/results:/output \
+        unet.sif train \
+        --data /data \
+        --output /output \
+        --epochs 1000 \
+        --batch 4 \
+        --lr 5e-4 \
+        --num-classes 5
+
+      Resume from checkpoint:
+        ... train --data /data --output /output --resume
+
+      Custom colormap (3 classes example):
+        ... train --data /data --num-classes 3 \
+            --colormap 0 0 0  255 0 0  0 0 255
+
+      Full option list:
+        apptainer run unet.sif train --help
+
+      Output: /output/checkpoint.pth  (best model, saves on each val improvement)
+
+    -----------------------------------------------------------------
+     MODE 2: MULTI-GPU DDP TRAINING
+    -----------------------------------------------------------------
+      apptainer run --nv \
+        --bind /host/dataset:/data \
+        --bind /host/results:/output \
+        unet.sif train_ddp \
+        --data /data \
+        --output /output \
+        --epochs 1000 \
+        --batch 4
+
+      The container uses HuggingFace Accelerate.
+      It auto-detects all visible GPUs.
+
+      Control which GPUs to use (on host before apptainer call):
+        export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+      Typical SLURM job script pattern:
+        #!/bin/bash
+        #SBATCH --gres=gpu:4
+        #SBATCH --ntasks-per-node=4
+        export CUDA_VISIBLE_DEVICES=0,1,2,3
+        apptainer run --nv \
+          --bind $SCRATCH/data:/data \
+          --bind $SCRATCH/results:/output \
+          unet.sif train_ddp \
+          --data /data --output /output --batch 4
+
+      Full option list:
+        apptainer run unet.sif train_ddp --help
+
+    -----------------------------------------------------------------
+     MODE 3: VISUALIZER (Gradio UI)
+    -----------------------------------------------------------------
+      Requires a trained checkpoint.pth from training (Mode 1 or 2).
+
+      Method A — bind-mount to sentinel path (recommended):
+        apptainer run --nv \
+          --bind /host/results/checkpoint.pth:/model/checkpoint.pth \
+          unet.sif visualize
+
+      Method B — explicit path:
+        apptainer run --nv \
+          unet.sif visualize --model /host/path/to/checkpoint.pth
+
+      The Gradio UI starts at http://0.0.0.0:7860
+
+      If on HPC (no browser on compute node), use SSH tunnel:
+        ssh -L 7860:localhost:7860 <login-node>
+        # Then open http://localhost:7860 on your laptop
+
+      Override port:
+        apptainer run --nv ... unet.sif visualize --port 8888
+
+      Full option list:
+        apptainer run unet.sif visualize --help
+
+    -----------------------------------------------------------------
+     MODE 4: INTERACTIVE SHELL
+    -----------------------------------------------------------------
+      apptainer run unet.sif bash
+      # Project is at /app/main, run python directly:
+      cd /app/main && python train_cli.py --help
+
+    -----------------------------------------------------------------
+     WHAT IS BAKED INTO THE IMAGE
+    -----------------------------------------------------------------
+      /app/main/
+        model.py          Attention-UNet architecture
+        train.py          original training code (unchanged)
+        train_ddp.py      original DDP code (unchanged)
+        train_cli.py      CLI wrapper → single-GPU
+        train_ddp_cli.py  CLI wrapper → DDP
+        metrics.py        DiceLoss / DiceCELoss
+        utils.py          seeding, EarlyStopping, checkpointing
+        visualizers/
+          visualizer.py     Gradio interface
+          vessel_analyzer.py vessel parameter analysis backend
+          model.py          (duplicate model for visualizer)
+          config.ini        reference config
+      /app/
+        run_visualizer.sh   launcher with model path override
+        unet_entrypoint.sh  main dispatcher
+        samples/            sample fundus images for testing
+
+    CUDA COMPATIBILITY
+      Minimum host driver: 525.85 (supports CUDA 12.4)
+      Compatible with CUDA 12.4 and above within the 12.x family.
