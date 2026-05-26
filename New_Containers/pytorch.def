@@ -1,0 +1,874 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
+
+%labels
+    Maintainer        YourOrg
+    Version           2.0.0
+    Framework         PyTorch 2.2.2
+    CUDA              12.1 (runs on 12.1 – 12.4+)
+    Min-Driver        525.60
+    cuDNN             8
+    Python            3.11
+    CPU-capable       yes
+    Supported-modes   train ddp export jupyter info bash
+    Description       Generic PyTorch training + inference base.
+                      No project code baked in — mount code at runtime.
+                      Supports: single-GPU, multi-GPU DDP (torchrun),
+                      ONNX export, headless JupyterLab (SSH port-forward).
+                      CPU fallback mandatory — runs on GPU-less nodes.
+
+# ─────────────────────────────────────────────────────────────
+# SETUP  (runs on HOST — pre-seeds apt config before %post)
+# ─────────────────────────────────────────────────────────────
+%setup
+    # Pre-seed apt sandbox fix before %post.
+    # Required when user is not in /etc/subuid and fakeroot is
+    # unavailable. Without this, apt's HTTP method fails with:
+    #   "E: setgroups 65534 failed - Operation not permitted"
+    mkdir -p ${APPTAINER_ROOTFS}/etc/apt/apt.conf.d
+    echo 'APT::Sandbox::User "root";' \
+        > ${APPTAINER_ROOTFS}/etc/apt/apt.conf.d/99sandbox-fix
+
+    # Standard mount-point stubs (blueprint §2, §9 — all 5 required).
+    # Apptainer does not require them to exist but having them
+    # makes --bind errors far easier to diagnose at runtime.
+    mkdir -p ${APPTAINER_ROOTFS}/code      # client mounts project source here
+    mkdir -p ${APPTAINER_ROOTFS}/data      # client mounts dataset here
+    mkdir -p ${APPTAINER_ROOTFS}/output    # client mounts results / checkpoints here
+    mkdir -p ${APPTAINER_ROOTFS}/model     # client mounts pretrained weights here
+    mkdir -p ${APPTAINER_ROOTFS}/scratch   # node-local temp / scratch space
+
+# ─────────────────────────────────────────────────────────────
+# BUILD STEPS
+# ─────────────────────────────────────────────────────────────
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ── System packages ───────────────────────────────────────
+    # NOTE: Cluster nodes have NO internet at runtime. Everything
+    # must be baked in here on the internet-connected build machine.
+    #
+    # vim
+    #   Mandatory editor — all users. Cannot be installed later.
+    #
+    # libibverbs1 + librdmacm1 + ibverbs-utils  (runtime, not -dev)
+    #   InfiniBand userspace libraries. Required for NCCL to
+    #   auto-detect and use IB fabric at runtime. Without them,
+    #   NCCL silently falls back to slower Ethernet paths.
+    #   Network fabric is variable (IB / Ethernet / other) so
+    #   baking these in means the same .sif works on any fabric
+    #   without a rebuild. -dev (header) variants are NOT needed
+    #   for runtime use — use the plain runtime packages.
+    #
+    # libgl1-mesa-glx
+    #   Real provider of libGL.so.1 on Ubuntu 20.04.
+    #   "libgl1" alone is a transitional meta-package with no files.
+    #   Without libgl1-mesa-glx: ImportError: libGL.so.1 not found.
+    #
+    # libglib2.0-0
+    #   Provides libgthread-2.0.so.0, required by cv2.
+    #
+    # libgomp1
+    #   OpenMP runtime required by scikit-learn / albumentations.
+    #
+    # lustre-client-utils
+    #   Cluster shared filesystem is Lustre. Tools (lfs, etc.) are
+    #   useful for users inspecting quotas / stripe settings.
+    #   Installed separately with fallback: not present in all apt
+    #   repos — admins add the Lustre repo on the build machine,
+    #   or this step is silently skipped.
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        vim \
+        wget \
+        curl \
+        git \
+        unzip \
+        zip \
+        ca-certificates \
+        ffmpeg \
+        libgl1-mesa-glx \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxrender1 \
+        libxext6 \
+        libgomp1 \
+        build-essential \
+        libibverbs1 \
+        librdmacm1 \
+        ibverbs-utils && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    # Lustre client tools — separate block; soft-fail if repo absent.
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        lustre-client-utils 2>/dev/null || \
+        echo "[WARN] lustre-client-utils not found in apt — skipping. Add Lustre repo on build machine to include."
+    apt-get clean && rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+
+    ldconfig
+
+    # Verify critical shared libraries are present (build fails otherwise).
+    ldconfig -p | grep libGL || {
+        echo "[ERROR] libGL.so.1 not found — aborting build."
+        exit 1
+    }
+    ldconfig -p | grep libibverbs || {
+        echo "[ERROR] libibverbs.so not found — aborting build."
+        exit 1
+    }
+
+    # ── Conda: configure + create Python 3.11 admin env ──────
+    # The pytorch base image ships conda + Python 3.10 in the base
+    # env. We leave base untouched and create 'py311' as the
+    # cluster-standard locked env (blueprint §3.2, §15).
+    #
+    # conda config:
+    #   channel_priority strict — prevents solver ambiguity
+    #   auto_activate_base false — users must explicitly activate
+    #
+    # py311 is the ONLY env in the .sif.
+    # Users create personal envs under $HOME/conda/envs/ (on Lustre)
+    # so they persist across container updates (blueprint §15).
+    #
+    # All package installs below use direct-path binaries to avoid
+    # needing 'conda activate' inside this build script.
+    conda config --set channel_priority strict
+    conda config --set auto_activate_base false
+    conda create -y -n py311 python=3.11
+
+    PIP311="/opt/conda/envs/py311/bin/pip"
+    PY311="/opt/conda/envs/py311/bin/python3"
+
+    # ── Pip bootstrap in py311 ────────────────────────────────
+    $PIP311 install --no-cache-dir "pip==24.0" "setuptools==69.5.1" "wheel==0.43.0"
+
+    # ── PyTorch 2.2.2 + ecosystem for Python 3.11 + CUDA 12.1 ─
+    # The base pytorch image has PyTorch wheels built for Python 3.10
+    # only. We reinstall explicitly into py311 using the official
+    # PyTorch CUDA 12.1 index (forward-compatible through 12.4+).
+    $PIP311 install --no-cache-dir \
+        "torch==2.2.2" \
+        "torchvision==0.17.2" \
+        "torchaudio==2.2.2" \
+        --index-url https://download.pytorch.org/whl/cu121
+
+    # ── numpy FIRST ───────────────────────────────────────────
+    # Must be installed before anything else that touches numpy's
+    # C API. torch 2.2 requires numpy <2.0. Installing numpy 2.x
+    # first (as a transitive dep) causes silent C-API crashes.
+    $PIP311 install --no-cache-dir "numpy==1.26.4"
+
+    # ── All other pinned packages ─────────────────────────────
+    #
+    # PINNING RATIONALE
+    # ─────────────────
+    # accelerate 0.30.0
+    #   Stable release for torch 2.2. Handles DDP, FSDP, and
+    #   multi-GPU launch without needing manual torchrun config.
+    #
+    # timm 0.9.16
+    #   Last stable 0.9.x release. 1.0+ changed the model API.
+    #   Provides pretrained ViT, ResNet, EfficientNet, etc.
+    #
+    # opencv-python-headless 4.9.0.80
+    #   4.9.x: last series declaring numpy>=1.21 (not >=2.0).
+    #   opencv 4.10+ requires numpy>=2.0, breaking torch 2.2.
+    #   headless: no Qt/X11 — correct for HPC/server containers.
+    #
+    # albumentations 1.4.6
+    #   Pinned to 1.x — albumentations 2.x changed the API
+    #   significantly (CoarseDropout args, transform signatures).
+    #   Most client codebases still use the 1.x API.
+    #
+    # onnx 1.16.0 + onnxruntime-gpu 1.18.0
+    #   Industry standard model interchange format.
+    #   onnxruntime-gpu 1.18 supports CUDA 12.x natively.
+    #   onnxruntime-gpu includes a CPU execution provider as
+    #   fallback — no separate onnxruntime package needed.
+    #
+    # tensorboard 2.16.2
+    #   Pinned to avoid protobuf>=5 conflict with older grpcio.
+    #
+    # pandas 2.2.2
+    #   Last release before the pandas 3.0 breaking API changes.
+    #
+    # scipy 1.13.1
+    #   Last numpy 1.x compatible release in the 1.13 series.
+    #
+    # einops 0.7.0
+    #   Tensor rearrangement ops used by virtually all modern
+    #   vision transformer implementations.
+    #
+    # jupyterlab 4.2.2
+    #   Mandatory for all containers (blueprint §3.3, checklist).
+    #   Launched headless; users access via SSH port-forward.
+    #   4.2.x is the latest stable 4.x series. Uses ServerApp.*
+    #   config keys (not the legacy NotebookApp.* from JupyterLab 3).
+    $PIP311 install --no-cache-dir \
+        "accelerate==0.30.0" \
+        "timm==0.9.16" \
+        "opencv-python-headless==4.9.0.80" \
+        "albumentations==1.4.6" \
+        "Pillow==10.3.0" \
+        "scikit-learn==1.4.2" \
+        "scikit-image==0.22.0" \
+        "scipy==1.13.1" \
+        "onnx==1.16.0" \
+        "onnxruntime-gpu==1.18.0" \
+        "tensorboard==2.16.2" \
+        "pandas==2.2.2" \
+        "matplotlib==3.8.4" \
+        "seaborn==0.13.2" \
+        "tqdm==4.66.4" \
+        "PyYAML==6.0.1" \
+        "psutil==5.9.8" \
+        "py-cpuinfo==9.0.0" \
+        "einops==0.7.0" \
+        "rich==13.7.1" \
+        "jupyterlab==4.2.2"
+
+    # ── Lock the environment ───────────────────────────────────
+    # Produces an exact reproducible snapshot of all installed
+    # packages. Archive this alongside the .sif for auditability
+    # and future rebuilds. Users never see this file.
+    $PIP311 freeze > /opt/requirements.lock
+    echo "[INFO] Environment locked → /opt/requirements.lock"
+
+    # ── Full smoke test ───────────────────────────────────────
+    # All imports must succeed; build fails on any error (set -e).
+    # Tests both GPU path and CPU fallback messaging.
+    $PY311 -c "
+import sys, os
+print(f'Python {sys.version}')
+assert sys.version_info >= (3, 11), f'Expected Python >= 3.11, got {sys.version}'
+
+import torch
+print(f'torch              {torch.__version__}')
+
+cuda_ok = torch.cuda.is_available()
+print(f'  CUDA available   {cuda_ok}')
+if cuda_ok:
+    print(f'  GPU count        {torch.cuda.device_count()}')
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        print(f'  GPU {i}            {p.name}  ({p.total_memory//1024**2} MB)')
+    print(f'  cuDNN version    {torch.backends.cudnn.version()}')
+    try:
+        nccl_ver = '.'.join(map(str, torch.cuda.nccl.version()))
+        print(f'  NCCL version     {nccl_ver}')
+    except Exception as e:
+        print(f'  NCCL version     unavailable ({e})')
+else:
+    print('  [INFO] No GPU at build time — CPU fallback path is active.')
+    print('         Container will run on GPU nodes when launched with --nv.')
+
+import numpy as np;         print(f'numpy              {np.__version__}')
+import cv2;                 print(f'opencv (headless)  {cv2.__version__}')
+import albumentations as A; print(f'albumentations     {A.__version__}')
+import accelerate;          print(f'accelerate         {accelerate.__version__}')
+import timm;                print(f'timm               {timm.__version__}')
+import sklearn;             print(f'scikit-learn       {sklearn.__version__}')
+import scipy;               print(f'scipy              {scipy.__version__}')
+import onnx;                print(f'onnx               {onnx.__version__}')
+import onnxruntime as ort;  print(f'onnxruntime-gpu    {ort.__version__}')
+import tensorboard;         print(f'tensorboard        {tensorboard.__version__}')
+import pandas as pd;        print(f'pandas             {pd.__version__}')
+import einops;              print(f'einops             {einops.__version__}')
+import jupyterlab;          print(f'jupyterlab         {jupyterlab.__version__}')
+print('ALL IMPORTS OK')
+"
+
+    # ── Write the entrypoint script ───────────────────────────
+    cat > /opt/entrypoint.sh << 'ENTRYPOINT'
+#!/usr/bin/env bash
+# =============================================================
+#  PyTorch Container Entrypoint
+#  Dispatches: train | ddp | export | jupyter | info | bash | [exec]
+# =============================================================
+set -euo pipefail
+
+MODE="${1:-help}"
+shift 2>/dev/null || true
+
+# Ensure cache dirs exist regardless of how the container is invoked
+# (apptainer run, apptainer exec, apptainer instance). %startscript
+# only runs for 'apptainer instance start', not for run/exec.
+mkdir -p "${HF_HOME:-/tmp/hf_cache}" "${TORCH_HOME:-/tmp/torch_cache}"
+
+# ── helpers ───────────────────────────────────────────────────
+_gpu_info() {
+    python3 -c "
+import torch, platform, sys
+print(f'  Python     : {sys.version.split()[0]}')
+print(f'  PyTorch    : {torch.__version__}')
+cuda_ok = torch.cuda.is_available()
+print(f'  CUDA avail : {cuda_ok}')
+if cuda_ok:
+    print(f'  GPU count  : {torch.cuda.device_count()}')
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        print(f'  GPU {i}      : {p.name}  ({p.total_memory//1024**2} MB)')
+    print(f'  cuDNN      : {torch.backends.cudnn.version()}')
+    try:
+        nccl_ver = '.'.join(map(str, torch.cuda.nccl.version()))
+        print(f'  NCCL       : {nccl_ver}')
+    except Exception:
+        print(f'  NCCL       : (version unavailable)')
+else:
+    print('  [WARN] No GPU detected — running in CPU mode.')
+    print('         Pass --nv to apptainer run/exec to expose GPUs.')
+print(f'  Platform   : {platform.platform()}')
+"
+}
+
+_help() {
+cat << 'EOF'
+=================================================================
+ PyTorch Container  |  v2.0.0
+ PyTorch 2.2.2  ·  CUDA 12.1+  ·  cuDNN 8  ·  Python 3.11
+ CPU-capable: yes (GPU fallback automatic)
+=================================================================
+USAGE
+  apptainer run --nv [BINDS] pytorch.sif [MODE] [ARGS...]
+  apptainer exec --nv [BINDS] pytorch.sif [COMMAND]
+
+STANDARD BIND POINTS
+  --bind /lustre/.../code:/code        Project source code
+  --bind /lustre/.../data:/data        Input dataset
+  --bind /lustre/.../output:/output    Checkpoints / results / logs
+  --bind /lustre/.../model:/model      Pretrained weights (optional)
+  --bind $TMPDIR:/scratch              Node-local scratch (optional)
+
+  Note: $HOME is auto-mounted by Apptainer.
+        Your conda envs (~/.conda/envs/) and dotfiles persist
+        because $HOME lives on Lustre.
+
+TWO-PHASE WORKFLOW (required — compute nodes have no internet)
+  Phase 1 — Login node (internet available):
+    wget / huggingface-cli / git clone → /lustre/.../data or code
+    All downloads land on Lustre (visible to all nodes).
+
+  Phase 2 — Compute node via SLURM (no internet):
+    SLURM job binds the Lustre paths and runs the container.
+    No downloads happen during job execution.
+
+MODES
+  train     Single-GPU (or CPU) training
+  ddp       Multi-GPU DDP training via torchrun
+  export    Export trained model to ONNX
+  jupyter   Headless JupyterLab (SSH port-forward access)
+  info      Print GPU / environment info
+  bash      Drop to interactive shell
+  [cmd]     Any other command executed directly
+
+-----------------------------------------------------------------
+ MODE: train  (single GPU or CPU)
+-----------------------------------------------------------------
+  apptainer run --nv \
+    --bind /lustre/code:/code \
+    --bind /lustre/data:/data \
+    --bind /lustre/output:/output \
+    pytorch.sif train \
+    --script /code/train.py \
+    [-- SCRIPT_ARGS...]
+
+  Options:
+    --script PATH     Python script to run (required)
+    --gpu    ID       GPU device id         [default: 0]
+    --       ARGS     Everything after -- is passed to the script
+
+  CPU-only example (no --nv):
+    apptainer run \
+      --bind /lustre/code:/code \
+      pytorch.sif train --script /code/train.py -- --epochs 5
+
+-----------------------------------------------------------------
+ MODE: ddp  (multi-GPU via torchrun)
+-----------------------------------------------------------------
+  apptainer run --nv \
+    --bind /lustre/code:/code \
+    --bind /lustre/data:/data \
+    --bind /lustre/output:/output \
+    pytorch.sif ddp \
+    --script /code/train.py \
+    --nproc  4 \
+    [-- SCRIPT_ARGS...]
+
+  Options:
+    --script      PATH    Python script to run (required)
+    --nproc       N       Number of GPUs / processes  [default: auto]
+    --master-port N       torchrun master port        [default: 29500]
+    --            ARGS    Everything after -- passed to the script
+
+  SLURM example:
+    #!/bin/bash
+    #SBATCH --gres=gpu:4
+    #SBATCH --cpus-per-task=16
+    apptainer run --nv \
+      --bind /lustre/code:/code \
+      --bind /lustre/data:/data \
+      --bind /lustre/output:/output \
+      pytorch-2.2.2-cuda12.1-train-v2.0.0.sif ddp \
+      --script /code/train.py --nproc 4 \
+      -- --data /data --epochs 100
+
+-----------------------------------------------------------------
+ MODE: export  (ONNX)
+-----------------------------------------------------------------
+  # Delegate to a user export script:
+  pytorch.sif export --script /code/export.py [-- ARGS]
+
+  # Built-in generic exporter:
+  pytorch.sif export \
+    --checkpoint /output/best.pth \
+    --output     /output/model.onnx \
+    --input-shape 1 3 512 512
+
+  Built-in options:
+    --checkpoint   PATH        Trained .pth file (required)
+    --output       PATH        Output .onnx path (required)
+    --input-shape  N N N N     Input tensor shape [default: 1 3 224 224]
+    --model-module PATH        Python file defining build_model() [optional]
+    --opset        N           ONNX opset version [default: 17]
+
+-----------------------------------------------------------------
+ MODE: jupyter  (headless JupyterLab, SSH port-forward)
+-----------------------------------------------------------------
+  apptainer run --nv \
+    --bind /lustre/code:/code \
+    --bind /lustre/data:/data \
+    --bind /lustre/output:/output \
+    pytorch.sif jupyter [--port PORT]
+
+  Options:
+    --port N    Port to listen on [default: 8888]
+                Check cluster policy for the allowed port range.
+
+  SLURM example:
+    #!/bin/bash
+    #SBATCH --gres=gpu:1
+    #SBATCH --time=08:00:00
+
+    PORT=8888
+    LOGIN="login01.cluster.example.com"
+
+    echo "============================================================"
+    echo "SSH tunnel (run this on YOUR laptop):"
+    echo "  ssh -NL ${PORT}:${SLURM_NODELIST}:${PORT} ${USER}@${LOGIN}"
+    echo "Then open: http://localhost:${PORT}"
+    echo "============================================================"
+
+    apptainer run --nv \
+      --bind /lustre/code:/code \
+      --bind /lustre/data:/data \
+      --bind /lustre/output:/output \
+      pytorch-2.2.2-cuda12.1-train-v2.0.0.sif jupyter --port $PORT
+
+  Security note:
+    Launched without a token (for internal cluster use).
+    To set a token: add  --ServerApp.token='yourtoken'  after --
+
+-----------------------------------------------------------------
+ MODE: info
+-----------------------------------------------------------------
+  apptainer run --nv pytorch.sif info
+
+-----------------------------------------------------------------
+ MODE: bash
+-----------------------------------------------------------------
+  apptainer run --nv pytorch.sif bash
+  apptainer run --nv pytorch.sif bash -c "python3 /code/eval.py"
+
+-----------------------------------------------------------------
+ USER CONDA ENVS  (personal, survive container updates)
+-----------------------------------------------------------------
+  Your $HOME is auto-mounted (Lustre-backed). Create personal
+  conda envs there — they persist even when the .sif is updated:
+
+    # Inside the container:
+    source /opt/conda/etc/profile.d/conda.sh
+    conda create -n myenv python=3.11
+    conda activate myenv
+    pip install <your-packages>
+
+  Using your env in a SLURM job:
+    apptainer exec --nv container.sif bash -c "
+      source /opt/conda/etc/profile.d/conda.sh
+      conda activate myenv
+      python3 /code/train.py
+    "
+
+=================================================================
+ INSTALLED PACKAGES
+=================================================================
+  torch 2.2.2  ·  torchvision 0.17.2  ·  torchaudio 2.2.2
+  numpy 1.26.4  ·  accelerate 0.30.0  ·  timm 0.9.16
+  opencv-headless 4.9.0.80  ·  albumentations 1.4.6  ·  Pillow 10.3.0
+  scikit-learn 1.4.2  ·  scikit-image 0.22.0  ·  scipy 1.13.1
+  onnx 1.16.0  ·  onnxruntime-gpu 1.18.0  ·  einops 0.7.0
+  tensorboard 2.16.2  ·  pandas 2.2.2  ·  matplotlib 3.8.4
+  seaborn 0.13.2  ·  tqdm 4.66.4  ·  PyYAML 6.0.1
+  psutil 5.9.8  ·  py-cpuinfo 9.0.0  ·  rich 13.7.1
+  jupyterlab 4.2.2
+
+=================================================================
+ CUDA COMPATIBILITY
+=================================================================
+  Minimum host driver : 525.60  (CUDA 12.1)
+  Tested range        : CUDA 12.1 – 12.4+ (forward compatible)
+  CPU fallback        : yes — runs on GPU-less nodes without --nv
+
+=================================================================
+EOF
+}
+
+case "$MODE" in
+  # ── single-GPU (or CPU) training ─────────────────────────
+  train)
+    SCRIPT=""
+    GPU="0"
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script) SCRIPT="$2"; shift 2 ;;
+        --gpu)    GPU="$2";    shift 2 ;;
+        --)       PASSTHROUGH=true; shift ;;
+        --help|-h) _help; exit 0 ;;
+        *) echo "[ERROR] Unknown option: $1"; _help; exit 1 ;;
+      esac
+    done
+    [[ -z "$SCRIPT" ]] && { echo "[ERROR] --script is required."; _help; exit 1; }
+    [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+    # GPU availability check — warn and proceed on CPU if no GPU visible.
+    GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())")
+    if [[ "$GPU_COUNT" -eq 0 ]]; then
+        echo "[WARN] No GPU detected (CUDA_VISIBLE_DEVICES may be unset or empty)."
+        echo "[WARN] Running in CPU mode. Pass --nv to apptainer run to expose GPUs."
+    else
+        export CUDA_VISIBLE_DEVICES="$GPU"
+        echo "[INFO] Single-GPU training | GPU=$GPU | script=$SCRIPT"
+    fi
+    exec python3 "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    ;;
+
+  # ── multi-GPU DDP via torchrun ───────────────────────────
+  ddp)
+    SCRIPT=""
+    NPROC=""
+    MASTER_PORT="29500"
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script)      SCRIPT="$2";       shift 2 ;;
+        --nproc)       NPROC="$2";        shift 2 ;;
+        --master-port) MASTER_PORT="$2";  shift 2 ;;
+        --)            PASSTHROUGH=true;  shift ;;
+        --help|-h)     _help; exit 0 ;;
+        *) echo "[ERROR] Unknown option: $1"; _help; exit 1 ;;
+      esac
+    done
+    [[ -z "$SCRIPT" ]] && { echo "[ERROR] --script is required."; _help; exit 1; }
+    [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+    # Auto-detect GPU count if --nproc not given.
+    if [[ -z "$NPROC" ]]; then
+        NPROC=$(python3 -c "import torch; print(torch.cuda.device_count())")
+        if [[ "$NPROC" -eq 0 ]]; then
+            echo "[WARN] No GPUs detected — falling back to 1 CPU process."
+            NPROC=1
+        else
+            echo "[INFO] Auto-detected $NPROC GPU(s)"
+        fi
+    fi
+    echo "[INFO] DDP training | nproc=$NPROC | port=$MASTER_PORT | script=$SCRIPT"
+    exec torchrun \
+        --nproc_per_node="$NPROC" \
+        --master_port="$MASTER_PORT" \
+        "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    ;;
+
+  # ── ONNX export ──────────────────────────────────────────
+  export)
+    SCRIPT=""
+    CHECKPOINT=""
+    ONNX_OUT=""
+    INPUT_SHAPE="1 3 224 224"
+    MODEL_MODULE=""
+    OPSET="17"
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script)       SCRIPT="$2";        shift 2 ;;
+        --checkpoint)   CHECKPOINT="$2";    shift 2 ;;
+        --output)       ONNX_OUT="$2";      shift 2 ;;
+        --input-shape)  INPUT_SHAPE="$2 $3 $4 $5"; shift 5 ;;
+        --model-module) MODEL_MODULE="$2";  shift 2 ;;
+        --opset)        OPSET="$2";         shift 2 ;;
+        --)             PASSTHROUGH=true;   shift ;;
+        --help|-h)      _help; exit 0 ;;
+        *) echo "[ERROR] Unknown option: $1"; _help; exit 1 ;;
+      esac
+    done
+    # If user gave --script, delegate to it entirely.
+    if [[ -n "$SCRIPT" ]]; then
+        [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+        exec python3 "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    fi
+    # Otherwise run the built-in generic exporter.
+    [[ -z "$CHECKPOINT" ]] && { echo "[ERROR] --checkpoint is required."; _help; exit 1; }
+    [[ -z "$ONNX_OUT"   ]] && { echo "[ERROR] --output is required.";     _help; exit 1; }
+    [[ ! -f "$CHECKPOINT" ]] && { echo "[ERROR] Checkpoint not found: $CHECKPOINT"; exit 1; }
+    echo "[INFO] ONNX export | checkpoint=$CHECKPOINT | output=$ONNX_OUT | opset=$OPSET"
+    python3 - << PYEOF
+import torch, onnx, sys, os
+sys.path.insert(0, "/code")
+checkpoint_path = "$CHECKPOINT"
+onnx_out        = "$ONNX_OUT"
+input_shape     = [int(x) for x in "$INPUT_SHAPE".split()]
+opset           = int("$OPSET")
+model_module    = "$MODEL_MODULE"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if not torch.cuda.is_available():
+    print("[WARN] No GPU — exporting on CPU.")
+# Load model definition from --model-module if given.
+model = None
+if model_module and os.path.isfile(model_module):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("user_model", model_module)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    model = mod.build_model()
+    print(f"[INFO] Loaded model from {model_module}")
+checkpoint = torch.load(checkpoint_path, map_location=device)
+if model is not None:
+    state = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state)
+else:
+    # Assume the checkpoint IS the full model (torch.save(model)).
+    model = checkpoint
+model = model.to(device).eval()
+dummy = torch.randn(*input_shape).to(device)
+os.makedirs(os.path.dirname(os.path.abspath(onnx_out)), exist_ok=True)
+torch.onnx.export(
+    model, dummy, onnx_out,
+    opset_version=opset,
+    input_names=["input"],
+    output_names=["output"],
+    dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+)
+onnx.checker.check_model(onnx_out)
+size_mb = os.path.getsize(onnx_out) / 1024**2
+print(f"[INFO] Exported and verified: {onnx_out}  ({size_mb:.1f} MB)")
+PYEOF
+    ;;
+
+  # ── headless JupyterLab (SSH port-forward access) ────────
+  jupyter)
+    PORT="8888"
+    JLAB_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then JLAB_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --port)   PORT="$2"; shift 2 ;;
+        --)       PASSTHROUGH=true; shift ;;
+        --help|-h) _help; exit 0 ;;
+        # Accept positional port number for convenience (e.g. pytorch.sif jupyter 8888)
+        [0-9]*) PORT="$1"; shift ;;
+        # Unknown flags are passed through to jupyter lab
+        --*) JLAB_ARGS+=("$1"); shift ;;
+        *) echo "[ERROR] Unknown option: $1"; _help; exit 1 ;;
+      esac
+    done
+    echo "[INFO] Starting JupyterLab — headless, port $PORT"
+    echo "[INFO] ─────────────────────────────────────────────────"
+    echo "[INFO] SSH tunnel (run this on YOUR laptop):"
+    echo "[INFO]   ssh -NL ${PORT}:${SLURMD_NODENAME:-localhost}:${PORT} <user>@<login-node>"
+    echo "[INFO] Then open: http://localhost:${PORT}"
+    echo "[INFO] ─────────────────────────────────────────────────"
+    echo "[INFO] Port range policy: check with your cluster admins."
+    exec jupyter lab \
+        --ip=0.0.0.0 \
+        --port="$PORT" \
+        --no-browser \
+        --ServerApp.token='' \
+        --ServerApp.password='' \
+        "${JLAB_ARGS[@]}"
+    ;;
+
+  # ── environment info ─────────────────────────────────────
+  info)
+    _gpu_info
+    ;;
+
+  # ── interactive shell ────────────────────────────────────
+  bash|shell)
+    exec /bin/bash "$@"
+    ;;
+
+  # ── help ─────────────────────────────────────────────────
+  help|--help|-h)
+    _help
+    ;;
+
+  # ── passthrough — run any command directly ───────────────
+  *)
+    exec "$MODE" "$@"
+    ;;
+esac
+ENTRYPOINT
+    chmod +x /opt/entrypoint.sh
+
+# ─────────────────────────────────────────────────────────────
+# ENVIRONMENT
+# ─────────────────────────────────────────────────────────────
+%environment
+    # ── Active environment: py311 (Python 3.11, admin-managed) ─
+    # Direct-path ordering ensures py311 binaries take precedence
+    # over the base conda env (Python 3.10) that ships in the image.
+    export PATH=/opt/conda/envs/py311/bin:/opt/conda/bin:/usr/local/bin:$PATH
+    export CONDA_DEFAULT_ENV=py311
+    export CONDA_PREFIX=/opt/conda/envs/py311
+
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+
+    # ── Telemetry suppression ─────────────────────────────────
+    export HF_HUB_DISABLE_TELEMETRY=1
+    export ACCELERATE_DISABLE_RICH=1
+    export NO_ALBUMENTATIONS_UPDATE=1
+
+    # ── OpenMP (from SLURM cpus-per-task, fallback 4) ─────────
+    # SLURM sets SLURM_CPUS_PER_TASK automatically. The fallback
+    # of 4 is used for interactive / login-node sessions.
+    export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
+
+    # ── NCCL fabric configuration ─────────────────────────────
+    # NCCL_DEBUG=WARN: informative without flooding job logs.
+    #   Do not use INFO in production — too verbose for batch jobs.
+    # NCCL_IB_DISABLE=0: allow NCCL to use InfiniBand when present.
+    #   libibverbs1 + librdmacm1 are baked in so NCCL can auto-
+    #   detect fabric (IB / RoCE / Ethernet) at runtime without
+    #   any per-cluster config in the container (blueprint §3.7).
+    # CUDA_VISIBLE_DEVICES: intentionally NOT set here.
+    #   SLURM manages GPU assignment via --gres=gpu:N.
+    export NCCL_DEBUG=WARN
+    export NCCL_IB_DISABLE=0
+
+    # ── Cache directories → /tmp (container root FS is read-only) ─
+    # Compute nodes have no internet. All model weights and datasets
+    # must be downloaded on the login node (Phase 1) and bind-mounted.
+    # HF_HOME and TORCH_HOME are used only for small metadata /
+    # tokenizer caches — /tmp is writable on every node.
+    export HF_HOME=/tmp/hf_cache
+    export TORCH_HOME=/tmp/torch_cache
+
+# ─────────────────────────────────────────────────────────────
+# STARTUP  (runs for 'apptainer instance start' only)
+# ─────────────────────────────────────────────────────────────
+%startscript
+    # Pre-create cache dirs and export vars for instance-mode use.
+    # For run/exec modes the entrypoint preamble handles this.
+    mkdir -p /tmp/hf_cache /tmp/torch_cache
+    export HF_HOME=/tmp/hf_cache
+    export TORCH_HOME=/tmp/torch_cache
+
+# ─────────────────────────────────────────────────────────────
+# DEFAULT RUN ACTION
+# ─────────────────────────────────────────────────────────────
+%runscript
+    # No args → show help then drop to interactive bash.
+    # With args → dispatch to the relevant mode via entrypoint.
+    if [[ $# -eq 0 ]]; then
+        /opt/entrypoint.sh help
+        echo ""
+        echo "Dropping to interactive shell. Type 'exit' to leave."
+        echo ""
+        exec /bin/bash
+    else
+        exec /opt/entrypoint.sh "$@"
+    fi
+
+# ─────────────────────────────────────────────────────────────
+# HELP   apptainer run-help pytorch.sif
+# ─────────────────────────────────────────────────────────────
+%help
+    =================================================================
+     PyTorch Training + Inference Container  v2.0.0
+     PyTorch 2.2.2  ·  CUDA 12.1+  ·  cuDNN 8  ·  Python 3.11
+     CPU-capable: yes  ·  No project code baked in
+    =================================================================
+    BUILD
+      apptainer build pytorch-2.2.2-cuda12.1-train-v2.0.0.sif pytorch.def
+
+    STANDARD BIND POINTS
+      /code    → project source code     (--bind /lustre/.../code:/code)
+      /data    → input datasets          (--bind /lustre/.../data:/data)
+      /output  → results / checkpoints   (--bind /lustre/.../output:/output)
+      /model   → pretrained weights      (--bind /lustre/.../model:/model)
+      /scratch → node-local temp         (--bind $TMPDIR:/scratch)
+
+    TWO-PHASE WORKFLOW
+      Phase 1 (login node — internet available):
+        Download data/weights/code to Lustre paths.
+      Phase 2 (compute node via SLURM — no internet):
+        Bind Lustre paths into container; run job. No downloads.
+
+    QUICK START
+      # Interactive (shows help then drops to bash):
+      apptainer run --nv pytorch-2.2.2-cuda12.1-train-v2.0.0.sif
+
+      # Single-GPU training:
+      apptainer run --nv \
+        --bind /lustre/code:/code --bind /lustre/data:/data \
+        --bind /lustre/output:/output \
+        pytorch-2.2.2-cuda12.1-train-v2.0.0.sif train \
+        --script /code/train.py -- --data /data --epochs 100
+
+      # Multi-GPU DDP:
+      apptainer run --nv \
+        --bind /lustre/code:/code --bind /lustre/data:/data \
+        --bind /lustre/output:/output \
+        pytorch-2.2.2-cuda12.1-train-v2.0.0.sif ddp \
+        --script /code/train.py --nproc 4 -- --data /data --epochs 100
+
+      # Headless JupyterLab:
+      apptainer run --nv \
+        --bind /lustre/code:/code \
+        pytorch-2.2.2-cuda12.1-train-v2.0.0.sif jupyter --port 8888
+      # SSH tunnel from your laptop:
+      #   ssh -NL 8888:<compute-node>:8888 <user>@<login-node>
+
+      # ONNX export (built-in):
+      apptainer run --nv \
+        --bind /lustre/output:/output \
+        pytorch-2.2.2-cuda12.1-train-v2.0.0.sif export \
+        --checkpoint /output/best.pth --output /output/model.onnx \
+        --input-shape 1 3 512 512
+
+      # GPU info:
+      apptainer run --nv pytorch-2.2.2-cuda12.1-train-v2.0.0.sif info
+
+      # CPU-only (no --nv): container falls back gracefully.
+      apptainer run pytorch-2.2.2-cuda12.1-train-v2.0.0.sif info
+
+    INSTALLED PACKAGES
+      torch 2.2.2  ·  torchvision 0.17.2  ·  torchaudio 2.2.2
+      numpy 1.26.4  ·  accelerate 0.30.0  ·  timm 0.9.16
+      opencv-headless 4.9.0.80  ·  albumentations 1.4.6  ·  Pillow 10.3.0
+      scikit-learn 1.4.2  ·  scikit-image 0.22.0  ·  scipy 1.13.1
+      onnx 1.16.0  ·  onnxruntime-gpu 1.18.0  ·  einops 0.7.0
+      tensorboard 2.16.2  ·  pandas 2.2.2  ·  matplotlib 3.8.4
+      seaborn 0.13.2  ·  tqdm 4.66.4  ·  rich 13.7.1
+      jupyterlab 4.2.2
+
+    CUDA COMPATIBILITY
+      Minimum host driver : 525.60  (CUDA 12.1)
+      Tested range        : CUDA 12.1 – 12.4+
+      CPU fallback        : yes — graceful on GPU-less nodes
