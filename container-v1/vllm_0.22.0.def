@@ -1,0 +1,601 @@
+Bootstrap: docker
+From: vllm/vllm-openai:v0.22.0-cu129-ubuntu2404
+
+%labels
+    Maintainer       Ankush / CDAC Pune
+    Org              CDAC
+    Version          1.0.0
+    Framework        vLLM 0.22.0
+    CUDA_Version     12.9
+    CUDA_Driver_Min  545.23.06
+    CUDA_Range       545.23.06 - 575.xx
+    Python_Version   3.12
+    CPU_Capable      yes
+    Description      vLLM 0.22.0 OpenAI-compatible inference server. Based on official vllm/vllm-openai image (CUDA 12.9, PyTorch 2.11, Transformers v5). Does NOT include training utilities, JupyterLab, or user venv workflow.
+    Modes            serve, serve-head, serve-worker, info, bash, help
+
+%setup
+    mkdir -p ${SINGULARITY_ROOTFS}/etc/apt/apt.conf.d
+    echo 'APT::Sandbox::User "root";' \
+      > ${SINGULARITY_ROOTFS}/etc/apt/apt.conf.d/99sandbox-fix
+
+    mkdir -p ${SINGULARITY_ROOTFS}/code
+    mkdir -p ${SINGULARITY_ROOTFS}/data
+    mkdir -p ${SINGULARITY_ROOTFS}/output
+    mkdir -p ${SINGULARITY_ROOTFS}/model
+    mkdir -p ${SINGULARITY_ROOTFS}/scratch
+
+%post
+    [ -z "$BASH" ] && exec /bin/bash "$0" "$@"
+    set -euo pipefail
+
+    # Install Ray for multi-node serving (not bundled in vllm-openai image)
+    pip install "ray[default]==2.49.1"
+
+    # Lock environment
+    mkdir -p /etc/pip
+    pip freeze > /etc/pip/constraint.txt
+
+    # Write entrypoint
+    cat > /opt/entrypoint.sh << 'ENTEOF'
+#!/bin/bash
+set -euo pipefail
+
+MODE="${1:-help}"
+shift 2>/dev/null || true
+
+GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo 0)
+
+_info() {
+python3 - <<'EOF'
+import sys
+def ver(mod, attr='__version__'):
+    try:
+        v = getattr(mod, attr, None)
+        if v is None:
+            import importlib.metadata
+            v = importlib.metadata.version(mod.__name__)
+        return str(v)
+    except Exception:
+        return '(unknown)'
+import torch, vllm, ray, transformers
+print(f"Python      : {sys.version.split()[0]}")
+print(f"PyTorch     : {ver(torch)}  CUDA: {torch.version.cuda}  cuDNN: {torch.backends.cudnn.version()}")
+print(f"vLLM        : {ver(vllm)}")
+print(f"Ray         : {ver(ray)}")
+print(f"Transformers: {ver(transformers)}")
+if torch.cuda.is_available():
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        print(f"  GPU {i}: {p.name} — {p.total_memory//1024**2} MB")
+else:
+    print("No GPU detected — CPU mode active (vLLM throughput severely limited)")
+EOF
+}
+
+case "$MODE" in
+    serve)
+        # Env: MODEL (required), HOST, PORT, TP_SIZE
+        # MODEL can be:
+        #   - A HuggingFace repo ID:  meta-llama/Meta-Llama-3.1-8B-Instruct
+        #     (bind your HF cache and set HF_HOME so vLLM finds cached weights)
+        #   - An absolute path:       /model/Meta-Llama-3.1-8B-Instruct
+        #     (bind the weights dir and point MODEL at the exact directory)
+        HOST="${HOST:-0.0.0.0}"
+        PORT="${PORT:-8000}"
+        TP_SIZE="${TP_SIZE:-1}"
+        if [ -z "${MODEL:-}" ] && ! printf '%s\n' "$@" | grep -q -- '--model'; then
+            echo "ERROR: MODEL env var or --model flag is required." >&2
+            echo "  Repo ID:  --env MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct  --env HF_HOME=/hf  --bind \$HOME/.cache/huggingface:/hf" >&2
+            echo "  Path:     --env MODEL=/model/Meta-Llama-3.1-8B-Instruct  --bind /path/to/weights:/model" >&2
+            exit 1
+        fi
+        [ "$GPU_COUNT" -eq 0 ] && echo "WARNING: No GPU detected — vLLM will run on CPU (very slow)"
+        MODEL_ARG=${MODEL:+--model "$MODEL"}
+        exec python3 -m vllm.entrypoints.openai.api_server \
+            ${MODEL_ARG} \
+            --host "$HOST" \
+            --port "$PORT" \
+            --tensor-parallel-size "$TP_SIZE" \
+            "$@"
+        ;;
+
+    serve-head)
+        # Env: MODEL (required), HOST, PORT, TP_SIZE, PP_SIZE, RAY_PORT
+        # MODEL supports HF repo ID or absolute path — same as serve mode.
+        HOST="${HOST:-0.0.0.0}"
+        PORT="${PORT:-8000}"
+        TP_SIZE="${TP_SIZE:-1}"
+        PP_SIZE="${PP_SIZE:-1}"
+        RAY_PORT="${RAY_PORT:-6379}"
+        if [ -z "${MODEL:-}" ] && ! printf '%s\n' "$@" | grep -q -- '--model'; then
+            echo "ERROR: MODEL env var or --model flag is required." >&2
+            exit 1
+        fi
+        mkdir -p /tmp/ray
+        ray start --head \
+            --port="$RAY_PORT" \
+            --num-gpus="$GPU_COUNT" \
+            --temp-dir=/tmp/ray
+        sleep 10
+        MODEL_ARG=${MODEL:+--model "$MODEL"}
+        exec python3 -m vllm.entrypoints.openai.api_server \
+            ${MODEL_ARG} \
+            --host "$HOST" \
+            --port "$PORT" \
+            --tensor-parallel-size "$TP_SIZE" \
+            --pipeline-parallel-size "$PP_SIZE" \
+            "$@"
+        ;;
+
+    serve-worker)
+        # Env: HEAD_ADDR (required), RAY_PORT
+        RAY_PORT="${RAY_PORT:-6379}"
+        if [ -z "${HEAD_ADDR:-}" ]; then
+            echo "ERROR: HEAD_ADDR env var is required (IP or hostname of head node)." >&2
+            exit 1
+        fi
+        mkdir -p /tmp/ray
+        exec ray start \
+            --address="${HEAD_ADDR}:${RAY_PORT}" \
+            --num-gpus="$GPU_COUNT" \
+            --temp-dir=/tmp/ray \
+            --block
+        ;;
+
+    info)  _info ;;
+    bash)  exec /bin/bash ;;
+
+    help|-h|--help)
+        cat << 'HELPEOF'
+Usage: apptainer exec --nv <container>.sif [MODE] [-- EXTRA_VLLM_ARGS]
+
+MODES
+  serve           Single-node inference server (tensor parallelism via TP_SIZE)
+  serve-head      Multi-node: Ray head + vLLM server on this node
+  serve-worker    Multi-node: Ray worker on non-head nodes
+  info            Print vLLM / PyTorch / CUDA / GPU inventory
+  bash            Interactive shell
+  help            This message
+
+Run: apptainer run-help <container>.sif  for full docs and SLURM examples.
+HELPEOF
+        ;;
+
+    *)  exec "$MODE" "$@" ;;
+esac
+ENTEOF
+    chmod +x /opt/entrypoint.sh
+
+    # Smoke test
+    python3 -c "
+import sys
+print('Python:', sys.version)
+
+def ver(mod, attr='__version__'):
+    try:
+        v = getattr(mod, attr, None)
+        if v is None:
+            import importlib.metadata
+            v = importlib.metadata.version(mod.__name__)
+        return str(v)
+    except Exception:
+        return '(version unknown)'
+
+def safe_import(name):
+    try:
+        import importlib
+        mod = importlib.import_module(name)
+        return mod, ver(mod)
+    except ImportError:
+        print(f'[WARNING] MISSING package: {name}')
+        return None, 'MISSING'
+
+packages = [
+    ('torch',        'PyTorch      '),
+    ('vllm',         'vLLM         '),
+    ('ray',          'Ray          '),
+    ('transformers', 'Transformers '),
+    ('numpy',        'NumPy        '),
+]
+
+missing = []
+for mod_name, label in packages:
+    _, version = safe_import(mod_name)
+    print(f'{label}: {version}')
+    if version == 'MISSING':
+        missing.append(mod_name)
+
+try:
+    import subprocess
+    r = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total',
+                        '--format=csv,noheader'], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        for i, line in enumerate(r.stdout.strip().split('\n')):
+            print(f'  GPU {i}: {line}')
+    else:
+        print('nvidia-smi: no GPU in build env — OK')
+except FileNotFoundError:
+    print('nvidia-smi not found in build env — expected')
+
+if missing:
+    print('BUILD WARNING:', missing, '— verify manually with: apptainer exec <container>.sif info')
+else:
+    print('ALL IMPORTS OK')
+"
+
+%environment
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    export PIP_CONSTRAINT=/etc/pip/constraint.txt
+    export HF_HUB_DISABLE_TELEMETRY=1
+    export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
+    # GPU / NCCL
+    export NCCL_DEBUG=WARN
+    export NCCL_IB_DISABLE=0
+    # vLLM — spawn avoids CUDA fork panics on multi-GPU
+    export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    # Ray must write to /tmp; .sif is read-only at runtime
+    export RAY_TMPDIR=/tmp/ray
+    export RAY_memory_usage_threshold=0.95
+    # Cache dirs — override HF_HOME at runtime to point at your bind mount
+    # e.g.  --env HF_HOME=/hf   (when you bind your .cache/huggingface to /hf)
+    # Defaults to /tmp so the container still works without a bind.
+    export HF_HOME=${HF_HOME:-/tmp/hf_cache}
+    export TORCH_HOME=${TORCH_HOME:-/tmp/torch_cache}
+    export TRANSFORMERS_CACHE=${HF_HOME}
+
+%startscript
+    [ -z "$BASH" ] && exec /bin/bash "$0" "$@"
+    mkdir -p /tmp/ray /tmp/hf_cache /tmp/torch_cache
+    exec /opt/entrypoint.sh "$@"
+
+%runscript
+    [ -z "$BASH" ] && exec /bin/bash "$0" "$@"
+    if [ $# -eq 0 ]; then
+        /opt/entrypoint.sh help
+        exec /bin/bash
+    else
+        exec /opt/entrypoint.sh "$@"
+    fi
+
+%help
+================================================================================
+  vLLM 0.22.0 Inference Container  v1.0.0
+  OpenAI-compatible LLM inference server.
+  Base: vllm/vllm-openai:v0.22.0-cu129-ubuntu2404
+  Stack: vLLM 0.22.0 | PyTorch 2.11 | CUDA 12.9 | Transformers v5 | Ray 2.49.1
+  Does NOT include: training utilities, JupyterLab, or user venv workflow.
+================================================================================
+
+BUILD
+--------------------------------------------------------------------------------
+  sudo apptainer build vllm-0.22.0-cuda12.9-infer-v1.0.0.sif \
+      vllm-0.22.0-cuda12.9-infer-v1.0.0.def
+
+  apptainer build --fakeroot vllm-0.22.0-cuda12.9-infer-v1.0.0.sif \
+      vllm-0.22.0-cuda12.9-infer-v1.0.0.def
+
+  Note: the base image is ~10 GB. Run the build on the login node.
+
+--------------------------------------------------------------------------------
+BIND POINTS
+--------------------------------------------------------------------------------
+  /model    Pretrained weights       /home/$USER/model/my-model  [explicit path pattern]
+  /hf       HuggingFace cache        $HOME/.cache/huggingface      [repo ID pattern]
+            When using /hf, also set: --env HF_HOME=/hf
+  /data     Input data (optional)    /home/$USER/data
+  /output   Results/logs (optional)  /home/$USER/output
+  /scratch  Node-local temp          $TMPDIR or /tmp/scratch
+  $HOME and /tmp are auto-mounted by Apptainer.
+
+--------------------------------------------------------------------------------
+APPTAINER FLAGS
+--------------------------------------------------------------------------------
+  --nv                Pass NVIDIA GPU(s) into container
+  --bind src:dst      Mount host path at container path
+  --env KEY=VALUE     Set env var inside container
+  --no-home           Do not auto-mount $HOME
+  --cleanenv          Clear host environment before entering
+
+  exec → run specific command   run → invoke %runscript   shell → interactive
+
+--------------------------------------------------------------------------------
+ENTRYPOINT MODES
+--------------------------------------------------------------------------------
+
+  serve   Single-node inference server (most common)
+
+    Key env vars:
+      MODEL      HuggingFace repo ID  OR  absolute path to weights  [required]
+      HF_HOME    HF cache dir inside container  [required when using repo ID]
+      HOST       Bind address            default: 0.0.0.0
+      PORT       API listen port         default: 8000
+      TP_SIZE    Tensor parallel size    default: 1  (set = number of GPUs)
+
+    PATTERN A — HuggingFace repo ID  (mirrors vllm/vllm-openai:latest behaviour)
+    Bind your existing HF cache so vLLM resolves the cached weights by name.
+    No snapshot hash needed.
+
+      apptainer run --nv \
+        --bind /home/$USER/.cache/huggingface:/hf \
+        --env HF_HOME=/hf \
+        --env MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct \
+        --env PORT=8000 \
+        <container>.sif serve \
+        --dtype bfloat16 \
+        --max-model-len 32768
+
+    PATTERN B — Explicit local path
+    Point MODEL at the directory that contains config.json / tokenizer.json.
+
+      apptainer run --nv \
+        --bind /home/$USER/model:/model \
+        --env MODEL=/model/Meta-Llama-3.1-8B-Instruct \
+        --env PORT=8000 \
+        <container>.sif serve \
+        --dtype bfloat16 \
+        --max-model-len 32768
+
+    4-GPU, 70B model (Pattern B):
+      apptainer exec --nv \
+        --bind /home/$USER/model:/model \
+        --env MODEL=/model/Llama-3-70B-Instruct \
+        --env TP_SIZE=4 \
+        <container>.sif serve \
+        --dtype bfloat16 \
+        --gpu-memory-utilization 0.90 \
+        --disable-log-requests
+
+    All args after MODE are forwarded directly to vllm serve.
+
+  serve-head   Multi-node Ray head (run on head node only)
+
+    Key env vars:
+      MODEL      HuggingFace repo ID or absolute path  [required]
+      HF_HOME    HF cache dir inside container  [if using repo ID]
+      TP_SIZE    Tensor parallel within one node   default: 1
+      PP_SIZE    Pipeline parallel across nodes    default: 1
+      RAY_PORT   Ray cluster port                  default: 6379
+
+  serve-worker   Multi-node Ray worker (all non-head nodes)
+
+    Key env vars:
+      HEAD_ADDR  Hostname or IP of head node  [required]
+      RAY_PORT   Must match serve-head         default: 6379
+
+  info    Print versions and GPU inventory
+    apptainer exec --nv <container>.sif info
+
+  bash    Interactive shell
+    apptainer exec --nv --bind /home/$USER/model:/model <container>.sif bash
+
+--------------------------------------------------------------------------------
+MODEL DIRECTORY STRUCTURES
+--------------------------------------------------------------------------------
+  vLLM expects different things depending on the format. The /model bind point
+  should contain one model at a time. Structure must match exactly or vLLM fails
+  at startup with a config/weight error.
+
+  FORMAT 1 — HuggingFace safetensors (most common, recommended)
+  ---------------------------------------------------------------
+  Download via: huggingface-cli download <repo> --local-dir /home/$USER/model/<name>
+
+  /home/$USER/model/Llama-3-70B-Instruct/
+  ├── config.json                   ← required — vLLM reads this first
+  ├── tokenizer.json                ← required
+  ├── tokenizer_config.json         ← required
+  ├── special_tokens_map.json
+  ├── generation_config.json
+  ├── model.safetensors.index.json  ← shard index (multi-shard models)
+  ├── model-00001-of-00008.safetensors
+  ├── model-00002-of-00008.safetensors
+  └── ...
+
+  Serve:
+    --env MODEL=/model/Llama-3-70B-Instruct
+
+  FORMAT 2 — HuggingFace pytorch bin (older models, fallback)
+  ------------------------------------------------------------
+  Same directory layout as safetensors but weights are .bin files instead.
+  vLLM falls back to this automatically if no .safetensors are found.
+
+  /home/$USER/model/OldModel/
+  ├── config.json
+  ├── tokenizer.json
+  ├── tokenizer_config.json
+  ├── pytorch_model.bin.index.json
+  ├── pytorch_model-00001-of-00003.bin
+  └── ...
+
+  Serve: same as safetensors — just point --model at the directory.
+
+  FORMAT 3 — GGUF (single file, quantized)
+  -----------------------------------------
+  Download the single .gguf file. vLLM only supports single-file GGUF —
+  if you have a split multi-file GGUF, merge it first with gguf-split.
+
+  IMPORTANT: vLLM's built-in GGUF tokenizer conversion is slow and buggy
+  for large vocabs. Always supply the base model tokenizer separately.
+  The tokenizer needs internet access — download it to home in Phase 1.
+
+  /home/$USER/model/
+  ├── Qwen3-30B-A3B-Q4_K_M.gguf          ← the model (single file)
+  └── Qwen3-30B-A3B-tokenizer/            ← base model tokenizer dir
+      ├── tokenizer.json
+      ├── tokenizer_config.json
+      └── special_tokens_map.json
+
+  Serve (--model points to the .gguf file, --tokenizer to the tokenizer dir):
+    apptainer exec --nv \
+      --bind /home/$USER/model:/model \
+      --env PORT=8000 \
+      <container>.sif serve \
+      --model /model/Qwen3-30B-A3B-Q4_K_M.gguf \
+      --tokenizer /model/Qwen3-30B-A3B-tokenizer
+
+  Note: do NOT set MODEL env var for GGUF — pass --model directly in extra
+  args since you also need --tokenizer. The MODEL env var only sets --model,
+  it cannot set --tokenizer.
+
+  FORMAT 4 — AWQ / GPTQ / FP8 (HF format + quantization metadata)
+  -----------------------------------------------------------------
+  Same directory layout as safetensors. The quantization type is declared
+  inside config.json — vLLM detects it automatically. No special flag needed
+  unless you want to override: --quantization awq|gptq|fp8
+
+  /home/$USER/model/Llama-3-70B-AWQ/
+  ├── config.json                   ← has "quantization_config" field inside
+  ├── tokenizer.json
+  ├── model-00001-of-00004.safetensors
+  └── ...
+
+  Serve: same as plain safetensors.
+
+  BIND PATTERN (all formats):
+    --bind /home/$USER/model:/model
+    The container sees everything under /model/.
+    Point --model at the right sub-path inside /model/.
+
+--------------------------------------------------------------------------------
+VLLM SERVE FLAGS — COMMONLY USED
+--------------------------------------------------------------------------------
+  --model PATH_OR_REPO_ID         Local path (e.g. /model/Llama-3-8B) or HF repo ID
+                                  (e.g. meta-llama/Meta-Llama-3.1-8B-Instruct — requires HF_HOME)
+  --tensor-parallel-size N        Split model across N GPUs on one node
+  --pipeline-parallel-size N      Split across N nodes (multi-node)
+  --dtype auto|float16|bfloat16   Weight dtype (bfloat16 for Ampere/Hopper)
+  --max-model-len N               Override max context length
+  --gpu-memory-utilization F      VRAM fraction to use  (default 0.90)
+  --quantization awq|gptq|fp8     Quantization method
+  --served-model-name NAME        Name in API /v1/models response
+  --trust-remote-code             Required for some architectures
+  --disable-log-requests          Suppress per-request logs (recommended)
+  --enable-prefix-caching         KV cache prefix reuse
+  --max-num-seqs N                Max concurrent sequences
+  --reasoning-parser NAME         Enable reasoning/thinking output parsing
+
+  API endpoints (PORT env var, default 8000):
+    http://<node>:$PORT/v1/chat/completions
+    http://<node>:$PORT/v1/models
+    http://<node>:$PORT/health
+
+  Override port:
+    --env PORT=9000   (in apptainer exec)
+    #SBATCH ...       then --env PORT=9000 in srun line
+
+--------------------------------------------------------------------------------
+SLURM — SINGLE-NODE GPU
+--------------------------------------------------------------------------------
+  Pattern A — HF cache bind (repo ID, mirrors vllm/vllm-openai:latest):
+  #!/bin/bash
+  #SBATCH --job-name=vllm-serve
+  #SBATCH --nodes=1
+  #SBATCH --ntasks=1
+  #SBATCH --gres=gpu:1
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=64G
+  #SBATCH --time=08:00:00
+
+  apptainer exec --nv \
+    --bind /home/$USER/.cache/huggingface:/hf \
+    --env HF_HOME=/hf \
+    --env MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --env PORT=8000 \
+    vllm-0.22.0-cuda12.9-infer-v1.0.0.sif serve \
+    --dtype bfloat16 \
+    --max-model-len 32768 \
+    --disable-log-requests
+
+  Pattern B — Explicit local path (4-GPU, 70B):
+  #!/bin/bash
+  #SBATCH --job-name=vllm-serve
+  #SBATCH --nodes=1
+  #SBATCH --ntasks=1
+  #SBATCH --gres=gpu:4
+  #SBATCH --cpus-per-task=16
+  #SBATCH --mem=128G
+  #SBATCH --time=08:00:00
+
+  apptainer exec --nv \
+    --bind /home/$USER/model:/model \
+    --env MODEL=/model/Llama-3-70B-Instruct \
+    --env TP_SIZE=4 \
+    --env PORT=8000 \
+    vllm-0.22.0-cuda12.9-infer-v1.0.0.sif serve \
+    --dtype bfloat16 \
+    --gpu-memory-utilization 0.90 \
+    --disable-log-requests
+
+  # Change PORT if 8000 is already in use on the node:
+  #   --env PORT=9001
+
+--------------------------------------------------------------------------------
+SLURM — MULTI-NODE (Ray pipeline parallelism)
+--------------------------------------------------------------------------------
+  #!/bin/bash
+  #SBATCH --job-name=vllm-multinode
+  #SBATCH --nodes=2
+  #SBATCH --ntasks=2
+  #SBATCH --gres=gpu:4
+  #SBATCH --cpus-per-task=32
+  #SBATCH --mem=256G
+  #SBATCH --time=08:00:00
+
+  HEAD_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+  WORKER_NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | tail -n +2)
+
+  srun --ntasks=1 --nodelist="$HEAD_NODE" \
+    apptainer exec --nv \
+      --bind /home/$USER/model:/model \
+      --env MODEL=/model/Llama-3-405B-Instruct \
+      --env TP_SIZE=4 --env PP_SIZE=2 \
+      vllm-0.22.0-cuda12.9-infer-v1.0.0.sif serve-head \
+      --dtype bfloat16 &
+
+  sleep 40
+
+  for WORKER in $WORKER_NODES; do
+    srun --ntasks=1 --nodelist="$WORKER" \
+      apptainer exec --nv \
+        --env HEAD_ADDR="$HEAD_NODE" \
+        vllm-0.22.0-cuda12.9-infer-v1.0.0.sif serve-worker &
+  done
+
+  wait
+
+--------------------------------------------------------------------------------
+TWO-PHASE WORKFLOW
+--------------------------------------------------------------------------------
+  Phase 1 (login node — internet access):
+    apptainer exec --bind /home/$USER/model:/model \
+      vllm-0.22.0-cuda12.9-infer-v1.0.0.sif bash
+    huggingface-cli download meta-llama/Llama-3.3-70B-Instruct \
+      --local-dir /model/Llama-3.3-70B-Instruct
+
+  Phase 2 (compute node via SLURM):
+    Bind /model, run serve — no network calls required.
+
+--------------------------------------------------------------------------------
+CUDA DRIVER COMPATIBILITY
+--------------------------------------------------------------------------------
+  Container CUDA   Min host driver
+  12.9             545.23.06
+  Check: nvidia-smi
+
+--------------------------------------------------------------------------------
+CPU FALLBACK
+--------------------------------------------------------------------------------
+  Run without --nv. Warning printed; vLLM continues on CPU (debug only).
+  Test: CUDA_VISIBLE_DEVICES="" apptainer exec <container>.sif info
+
+--------------------------------------------------------------------------------
+INSTALLED PACKAGES (from base image — verify with pip freeze after build)
+--------------------------------------------------------------------------------
+  vLLM            0.22.0
+  PyTorch         2.11.x+cu129
+  Ray             2.49.1
+  Transformers    5.x
+  CUDA            12.9
+================================================================================
+

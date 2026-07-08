@@ -1,0 +1,527 @@
+Bootstrap: docker
+From: python:3.11-slim-bookworm
+
+%labels
+    Maintainer       Ankush / CDAC Pune
+    Org              CDAC
+    Version          1.0.0
+    Framework        scikit-learn 1.5.2
+    CUDA_Version     N/A
+    CUDA_Driver_Min  N/A
+    CUDA_Range       N/A
+    cuDNN_Version    N/A
+    Python_Version   3.11
+    CPU_Capable      yes
+    Description      CPU-only ML + DS base. scikit-learn, XGBoost, LightGBM, CatBoost, \
+                     pandas, scipy, statsmodels, matplotlib, seaborn, plotly, optuna, \
+                     JupyterLab. No deep learning / no CUDA. Mount code at /code.
+    Modes            train, dist, jupyter, info, bash
+
+%setup
+    mkdir -p ${SINGULARITY_ROOTFS}/etc/apt/apt.conf.d
+    echo 'APT::Sandbox::User "root";' \
+      > ${SINGULARITY_ROOTFS}/etc/apt/apt.conf.d/99sandbox-fix
+
+    mkdir -p ${SINGULARITY_ROOTFS}/code
+    mkdir -p ${SINGULARITY_ROOTFS}/data
+    mkdir -p ${SINGULARITY_ROOTFS}/output
+    mkdir -p ${SINGULARITY_ROOTFS}/model
+    mkdir -p ${SINGULARITY_ROOTFS}/scratch
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # CPU-only container — no InfiniBand packages needed
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        wget curl git unzip zip ca-certificates \
+        ffmpeg libgl1-mesa-glx libgl1 \
+        libglib2.0-0 libsm6 libxrender1 libxext6 \
+        libgomp1 build-essential vim
+
+    # pip bootstrap — verify these against PyPI at build time
+    pip install --no-cache-dir "pip==24.3.1" "setuptools==75.6.0" "wheel==0.45.1"
+
+    # numpy FIRST — must precede all scientific packages
+    pip install --no-cache-dir "numpy==2.0.2"
+
+    pip install --no-cache-dir \
+        "scikit-learn==1.5.2" \
+        "xgboost==2.1.1" \
+        "lightgbm==4.5.0" \
+        "catboost==1.2.7" \
+        "pandas==2.2.3" \
+        "scipy==1.14.1" \
+        "statsmodels==0.14.4" \
+        "matplotlib==3.9.2" \
+        "seaborn==0.13.2" \
+        "plotly==5.24.1" \
+        "optuna==4.0.0" \
+        "imbalanced-learn==0.12.4" \
+        "Pillow==10.4.0" \
+        "tqdm==4.66.5" \
+        "PyYAML==6.0.2" \
+        "psutil==6.0.0" \
+        "py-cpuinfo==9.0.0" \
+        "rich==13.9.4" \
+        "joblib==1.4.2"
+
+    pip install --no-cache-dir "jupyterlab==4.3.0"
+
+    mkdir -p /etc/pip
+    pip freeze > /etc/pip/constraint.txt
+
+    # ── Write entrypoint ──────────────────────────────────────
+    cat > /opt/entrypoint.sh << 'ENTRYPOINT'
+#!/bin/bash
+set -euo pipefail
+
+MODE="${1:-help}"
+shift 2>/dev/null || true
+
+GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo 0)
+
+_info() {
+    python3 - <<'EOF'
+import sys, sklearn, numpy as np, pandas as pd, scipy, xgboost, lightgbm, catboost
+print(f"Python       : {sys.version.split()[0]}")
+print(f"scikit-learn : {sklearn.__version__}")
+print(f"NumPy        : {np.__version__}")
+print(f"pandas       : {pd.__version__}")
+print(f"scipy        : {scipy.__version__}")
+print(f"XGBoost      : {xgboost.__version__}")
+print(f"LightGBM     : {lightgbm.__version__}")
+print(f"CatBoost     : {catboost.__version__}")
+print(f"CPU-only container — --nv not needed")
+EOF
+}
+
+case "$MODE" in
+
+  train)
+    SCRIPT=""
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script)  SCRIPT="$2"; shift 2 ;;
+        --)        PASSTHROUGH=true; shift ;;
+        --help|-h) exec /opt/entrypoint.sh help ;;
+        *) echo "[ERROR] Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    [[ -z "$SCRIPT" ]]   && { echo "[ERROR] --script is required. Use: train --script PATH"; exit 1; }
+    [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+    echo "[INFO] train | script=$SCRIPT"
+    exec python3 "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    ;;
+
+  dist)
+    # CPU ML: no torchrun. dist sets OMP/JOBLIB thread counts and runs python3.
+    # Use n_jobs=-1 in sklearn/joblib calls to exploit all allocated cores.
+    SCRIPT=""
+    NPROC=""
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script)  SCRIPT="$2"; shift 2 ;;
+        --nproc)   NPROC="$2";  shift 2 ;;
+        --)        PASSTHROUGH=true; shift ;;
+        --help|-h) exec /opt/entrypoint.sh help ;;
+        *) echo "[ERROR] Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    [[ -z "$SCRIPT" ]]   && { echo "[ERROR] --script is required. Use: dist --script PATH"; exit 1; }
+    [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+    if [[ -n "$NPROC" ]]; then
+        export OMP_NUM_THREADS="$NPROC"
+        export JOBLIB_NUM_THREADS="$NPROC"
+        echo "[INFO] dist | nproc=$NPROC (OMP_NUM_THREADS + JOBLIB_NUM_THREADS set)"
+    else
+        echo "[INFO] dist | nproc=auto (inherits OMP_NUM_THREADS from SLURM or default)"
+    fi
+    echo "[INFO] dist | script=$SCRIPT — use n_jobs=-1 in sklearn/joblib calls"
+    exec python3 "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    ;;
+
+  jupyter)
+    PORT="8888"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --port) PORT="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    echo "[INFO] JupyterLab on port $PORT — SSH tunnel: ssh -L ${PORT}:<node>:${PORT} <user>@<login>"
+    exec jupyter lab \
+        --no-browser \
+        --ip=0.0.0.0 \
+        --port="$PORT" \
+        --notebook-dir=/code \
+        --ServerApp.token='' \
+        --ServerApp.password=''
+    ;;
+
+  info)
+    _info
+    ;;
+
+  bash|shell)
+    exec /bin/bash "$@"
+    ;;
+
+  help|--help|-h)
+    cat << 'HELPEOF'
+Usage: apptainer exec <container>.sif [MODE] [ARGS...]
+
+Modes:
+  train   --script PATH [-- SCRIPT_ARGS]       Single-process ML on CPU
+  dist    --script PATH [--nproc N] [-- ARGS]  Parallel ML (sets OMP/JOBLIB threads)
+  jupyter [--port N]                            Headless JupyterLab
+  info                                          Print framework versions + env info
+  bash                                          Interactive shell
+  <cmd>                                         Passthrough to any command
+
+Run: apptainer run-help <container>.sif  for full documentation.
+HELPEOF
+    ;;
+
+  *)
+    exec "$MODE" "$@"
+    ;;
+
+esac
+ENTRYPOINT
+    chmod +x /opt/entrypoint.sh
+
+    # ── Smoke test ────────────────────────────────────────────
+    python3 -c "
+import sys
+print('Python:', sys.version.split()[0])
+
+def ver(mod, attr='__version__'):
+    try:
+        v = getattr(mod, attr, None)
+        if v is None:
+            import importlib.metadata
+            v = importlib.metadata.version(mod.__name__)
+        return str(v)
+    except Exception:
+        return '(version unknown)'
+
+import numpy as np;             print('numpy              ', ver(np))
+import sklearn;                 print('scikit-learn       ', ver(sklearn))
+import xgboost;                 print('xgboost            ', ver(xgboost))
+import lightgbm;                print('lightgbm           ', ver(lightgbm))
+import catboost;                print('catboost           ', ver(catboost))
+import pandas as pd;            print('pandas             ', ver(pd))
+import scipy;                   print('scipy              ', ver(scipy))
+import statsmodels;             print('statsmodels        ', ver(statsmodels))
+import matplotlib;              print('matplotlib         ', ver(matplotlib))
+import seaborn;                 print('seaborn            ', ver(seaborn))
+import plotly;                  print('plotly             ', ver(plotly))
+import optuna;                  print('optuna             ', ver(optuna))
+import imblearn;                print('imbalanced-learn   ', ver(imblearn))
+import PIL;                     print('Pillow             ', ver(PIL, 'VERSION'))
+import tqdm;                    print('tqdm               ', ver(tqdm))
+import yaml;                    print('PyYAML             ', ver(yaml))
+import psutil;                  print('psutil             ', ver(psutil))
+import cpuinfo;                 print('py-cpuinfo         ', ver(cpuinfo))
+import rich;                    print('rich               ', ver(rich))
+import joblib;                  print('joblib             ', ver(joblib))
+import jupyterlab;              print('jupyterlab         ', ver(jupyterlab))
+
+try:
+    import subprocess
+    r = subprocess.run(['nvidia-smi','--query-gpu=name,memory.total','--format=csv,noheader'],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        for i, l in enumerate(r.stdout.strip().split('\n')):
+            print(f'  GPU {i}: {l}')
+    else:
+        print('nvidia-smi: no GPU visible (CPU-only build env — OK)')
+except FileNotFoundError:
+    print('nvidia-smi not found in build env — CPU-only container (expected)')
+
+print('ALL IMPORTS OK')
+"
+
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+    ldconfig
+    ldconfig -p | grep libGL || { echo "[ERROR] libGL.so.1 not found"; exit 1; }
+
+%environment
+    export PATH=/usr/local/bin:$PATH
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    export PIP_CONSTRAINT=/etc/pip/constraint.txt
+    export HF_HUB_DISABLE_TELEMETRY=1
+    export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
+    export MPLBACKEND=Agg
+
+%startscript
+    mkdir -p /tmp/fw_cache
+    exec /opt/entrypoint.sh "$@"
+
+%runscript
+    if [ $# -eq 0 ]; then
+        /opt/entrypoint.sh help
+        exec /bin/bash
+    else
+        exec /opt/entrypoint.sh "$@"
+    fi
+
+%help
+================================================================================
+  ML + DS Base Container  v1.0.0
+  scikit-learn 1.5.2  ·  Python 3.11  ·  CPU-only
+  Includes: scikit-learn, XGBoost, LightGBM, CatBoost, pandas, scipy,
+            statsmodels, matplotlib, seaborn, plotly, optuna, JupyterLab.
+  No deep learning / no CUDA. Mount code at /code.
+================================================================================
+
+BUILD
+  sudo apptainer build <container>.sif <container>.def
+  apptainer build --fakeroot <container>.sif <container>.def
+
+--------------------------------------------------------------------------------
+BIND POINTS
+--------------------------------------------------------------------------------
+  Container path   Purpose                    Example host path
+  ---------------  -------------------------  ---------------------------------
+  /code            Project source code        /home/$USER/myproject/code
+  /data            Input datasets             /home/$USER/myproject/data
+  /output          Results, trained models    /home/$USER/myproject/output
+  /model           Pretrained models          /home/$USER/myproject/model
+  /scratch         Node-local temp            $TMPDIR  or  /tmp/scratch
+
+  Auto-mounted by Apptainer (no --bind needed):
+    $HOME  → Lustre home dir  (venvs, dotfiles persist here)
+    /tmp   → node-local temp
+
+--------------------------------------------------------------------------------
+APPTAINER FLAGS
+--------------------------------------------------------------------------------
+  --bind src:dst        Mount host path at container path
+  --env KEY=VALUE       Set environment variable inside container
+  --writable-tmpfs      Add writable overlay (when a tool must write its own dir)
+  --no-home             Do not auto-mount $HOME (reproducibility tests)
+  --cleanenv            Clear host environment before entering container
+
+  NOTE: --nv is NOT needed — this is a CPU-only container.
+
+  apptainer exec  <container>.sif <cmd>   → run a specific command
+  apptainer run   <container>.sif [args]  → invoke entrypoint
+  apptainer shell <container>.sif         → interactive shell
+
+--------------------------------------------------------------------------------
+ENTRYPOINT MODES
+--------------------------------------------------------------------------------
+
+  TRAIN — single-process ML on CPU
+  ─────────────────────────────────
+  Flags:
+    --script PATH     Training script (required)
+    -- ARGS           Forwarded to your script
+
+  Examples:
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      --bind /home/$USER/proj/output:/output \
+      <container>.sif train --script /code/train.py -- --n-estimators 500
+
+    # CPU-only node — no --nv, no --gres=gpu in SBATCH
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      <container>.sif train --script /code/train.py
+
+  DIST — parallel ML using all allocated cores
+  ─────────────────────────────────────────────
+  No GPU-distributed training. dist sets OMP_NUM_THREADS and JOBLIB_NUM_THREADS
+  so sklearn/joblib uses the specified core count. Your script must use n_jobs=-1
+  (or n_jobs=N) to enable parallelism.
+
+  Flags:
+    --script PATH     Training script (required)
+    --nproc  N        Number of parallel cores (default: inherits from SLURM)
+    -- ARGS           Forwarded to your script
+
+  Examples:
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      --bind /home/$USER/proj/output:/output \
+      <container>.sif dist --script /code/train.py --nproc 32
+
+    # SLURM allocates cores; OMP_NUM_THREADS picks them up automatically:
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      <container>.sif dist --script /code/train.py
+
+  JUPYTER — headless JupyterLab via SSH tunnel
+  ────────────────────────────────────────────
+  Flags:
+    --port N    Port (default: 8888)
+
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      <container>.sif jupyter --port 8888
+
+  SSH tunnel from your local machine:
+    ssh -L 8888:<compute-node-hostname>:8888 <username>@<login-node>
+  Then open: http://localhost:8888
+
+  INFO — print framework versions and environment
+  ─────────────────────────────────────────────────
+    apptainer exec <container>.sif info
+
+  BASH — interactive shell
+  ────────────────────────
+    apptainer exec --bind /home/$USER/proj/code:/code <container>.sif bash
+
+  PASSTHROUGH — run any command directly
+  ──────────────────────────────────────
+    apptainer exec <container>.sif python3 /code/eval.py
+    apptainer exec <container>.sif pip list
+
+--------------------------------------------------------------------------------
+SLURM INTEGRATION
+--------------------------------------------------------------------------------
+  Single-node CPU training:
+
+    #!/bin/bash
+    #SBATCH --job-name=ml_train
+    #SBATCH --nodes=1
+    #SBATCH --ntasks=1
+    #SBATCH --cpus-per-task=32
+    #SBATCH --mem=64G
+    #SBATCH --time=04:00:00
+    #SBATCH --output=logs/%j.out
+
+    SIF=/home/$USER/containers/<container>.sif
+    CODE=/home/$USER/myproject/code
+    DATA=/home/$USER/myproject/data
+    OUTPUT=/home/$USER/myproject/output
+
+    apptainer exec \
+      --bind $CODE:/code \
+      --bind $DATA:/data \
+      --bind $OUTPUT:/output \
+      $SIF train --script /code/train.py -- --n-estimators 1000
+
+  Parallel ML (dist mode — use n_jobs=-1 in your script):
+
+    #!/bin/bash
+    #SBATCH --job-name=ml_parallel
+    #SBATCH --nodes=1
+    #SBATCH --ntasks=1
+    #SBATCH --cpus-per-task=64
+    #SBATCH --mem=128G
+    #SBATCH --time=08:00:00
+    #SBATCH --output=logs/%j.out
+
+    SIF=/home/$USER/containers/<container>.sif
+
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      --bind /home/$USER/proj/output:/output \
+      $SIF dist --script /code/train.py --nproc 64
+
+  JupyterLab interactive session:
+
+    #!/bin/bash
+    #SBATCH --job-name=ml_jupyter
+    #SBATCH --nodes=1
+    #SBATCH --ntasks=1
+    #SBATCH --cpus-per-task=16
+    #SBATCH --mem=32G
+    #SBATCH --time=02:00:00
+    #SBATCH --output=logs/jupyter_%j.out
+
+    SIF=/home/$USER/containers/<container>.sif
+
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      $SIF jupyter --port 8888
+
+--------------------------------------------------------------------------------
+TWO-PHASE WORKFLOW
+--------------------------------------------------------------------------------
+  Compute nodes have NO internet access. Prepare everything on the login node.
+
+  Phase 1 — Login node (internet available):
+    wget https://example.com/dataset.csv -P /home/$USER/proj/data/
+    git clone https://github.com/yourorg/project /home/$USER/proj/code/
+
+  Phase 2 — Compute node (SLURM job, no internet):
+    Bind /code, /data, /output — container reads from /code and /data, writes to /output.
+
+--------------------------------------------------------------------------------
+USER VENV WORKFLOW  (how to install extra packages)
+--------------------------------------------------------------------------------
+  The base Python is locked via PIP_CONSTRAINT. To add packages:
+
+  Create once (login node or interactive session):
+    apptainer exec <container>.sif bash
+    python3 -m venv --system-site-packages $HOME/envs/myenv
+    source $HOME/envs/myenv/bin/activate
+    unset PIP_CONSTRAINT          # REQUIRED — releases the base env lock
+    pip install <your-extra-packages>
+    deactivate
+
+  Use in a SLURM job:
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      <container>.sif bash -c "
+        source \$HOME/envs/myenv/bin/activate
+        unset PIP_CONSTRAINT
+        python3 /code/train.py
+      "
+
+  Why --system-site-packages?
+    Your venv inherits all container packages. You only install deltas, not the full stack.
+
+  Why unset PIP_CONSTRAINT?
+    The lock protects the base container env. Your venv is yours — unlock it.
+
+  Your venvs live in $HOME (Lustre-backed) and persist across container updates.
+
+--------------------------------------------------------------------------------
+CPU FALLBACK
+--------------------------------------------------------------------------------
+  This is a CPU-only container. --nv is never needed. Runs on all node types.
+  sklearn parallelism via n_jobs=-1 uses joblib internally.
+  OMP_NUM_THREADS is set from SLURM cpus-per-task (default: 4).
+  MPLBACKEND=Agg — matplotlib saves plots to file (no display required).
+  Test: apptainer exec <container>.sif info
+
+--------------------------------------------------------------------------------
+INSTALLED PACKAGES
+--------------------------------------------------------------------------------
+  scikit-learn       1.5.2
+  xgboost            2.1.1
+  lightgbm           4.5.0
+  catboost           1.2.7
+  numpy              2.0.2
+  pandas             2.2.3
+  scipy              1.14.1
+  statsmodels        0.14.4
+  matplotlib         3.9.2
+  seaborn            0.13.2
+  plotly             5.24.1
+  optuna             4.0.0
+  imbalanced-learn   0.12.4
+  Pillow             10.4.0
+  tqdm               4.66.5
+  PyYAML             6.0.2
+  psutil             6.0.0
+  py-cpuinfo         9.0.0
+  rich               13.9.4
+  joblib             1.4.2
+  jupyterlab         4.3.0
+================================================================================

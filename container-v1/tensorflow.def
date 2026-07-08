@@ -1,0 +1,657 @@
+Bootstrap: docker
+From: tensorflow/tensorflow:2.16.1-gpu
+
+%labels
+    Maintainer       Ankush / CDAC Pune
+    Org              CDAC
+    Version          1.0.0
+    Framework        TensorFlow 2.16.1
+    CUDA_Version     12.3
+    CUDA_Driver_Min  525.60
+    CUDA_Range       525.60 (CUDA 12.1) – tested through CUDA 12.4+
+    cuDNN_Version    8
+    Python_Version   3.11
+    CPU_Capable      yes
+    Description      TensorFlow 2.16.1 training + inference base. No project code baked in — mount code at /code. Supports single-GPU, multi-GPU MirroredStrategy, SavedModel export, ONNX export.
+    Modes            train, dist, export, jupyter, info, bash
+
+%setup
+    mkdir -p ${SINGULARITY_ROOTFS}/etc/apt/apt.conf.d
+    echo 'APT::Sandbox::User "root";' \
+      > ${SINGULARITY_ROOTFS}/etc/apt/apt.conf.d/99sandbox-fix
+
+    mkdir -p ${SINGULARITY_ROOTFS}/code
+    mkdir -p ${SINGULARITY_ROOTFS}/data
+    mkdir -p ${SINGULARITY_ROOTFS}/output
+    mkdir -p ${SINGULARITY_ROOTFS}/model
+    mkdir -p ${SINGULARITY_ROOTFS}/scratch
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        wget curl git unzip zip ca-certificates \
+        ffmpeg libgl1-mesa-glx libgl1 \
+        libglib2.0-0 libsm6 libxrender1 libxext6 \
+        libgomp1 build-essential \
+        vim \
+        protobuf-compiler \
+        libibverbs1 librdmacm1 ibverbs-utils
+
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    ldconfig
+    ldconfig -p | grep libGL || { echo "[ERROR] libGL.so.1 not found — aborting."; exit 1; }
+    ldconfig -p | grep libibverbs || { echo "[ERROR] libibverbs.so not found — aborting."; exit 1; }
+
+    pip install --upgrade pip setuptools wheel
+
+    # numpy first — wrong version = C-API crash with TF/cv2/scipy
+    pip install --no-cache-dir "numpy==1.26.4"
+
+    # Do NOT reinstall tensorflow — base image has CUDA-linked .so files.
+    # Do NOT pip-install nvidia-* packages — base image has system CUDA libs.
+    # tf2onnx 1.16.1: converts TF SavedModel/Keras → ONNX; requires onnx
+    # opencv-python-headless 4.9.0.80: 4.10+ requires numpy>=2.0
+    # albumentations 1.4.6: pinned to 1.x API; 2.x changed signatures
+    # tensorboard 2.16.2: must share major version with TF to avoid protobuf conflicts
+    pip install --no-cache-dir \
+        "opencv-python-headless==4.9.0.80" \
+        "albumentations==1.4.6" \
+        "Pillow==10.3.0" \
+        "scikit-learn==1.4.2" \
+        "scikit-image==0.22.0" \
+        "scipy==1.13.1" \
+        "tensorflow-datasets==4.9.6" \
+        "onnx==1.16.0" \
+        "tf2onnx==1.16.1" \
+        "onnxruntime-gpu==1.18.0" \
+        "tensorboard==2.16.2" \
+        "pandas==2.2.2" \
+        "matplotlib==3.8.4" \
+        "seaborn==0.13.2" \
+        "tqdm==4.66.5" \
+        "PyYAML==6.0.2" \
+        "psutil==5.9.8" \
+        "einops==0.7.0" \
+        "rich==13.7.1"
+
+    pip install --no-cache-dir "jupyterlab==4.2.4"
+
+    mkdir -p /etc/pip
+    pip freeze > /etc/pip/constraint.txt
+
+    python3 -c "
+import sys
+print('Python:', sys.version)
+
+def ver(mod, attr='__version__'):
+    try:
+        v = getattr(mod, attr, None)
+        if v is None:
+            import importlib.metadata
+            v = importlib.metadata.version(mod.__name__)
+        return str(v)
+    except Exception:
+        return '(version unknown)'
+
+import tensorflow as tf
+print('tensorflow            ', ver(tf))
+print('  GPU devices         ', tf.config.list_physical_devices('GPU'))
+print('  Built with CUDA     ', tf.test.is_built_with_cuda())
+
+import numpy as np;            print('numpy                 ', ver(np))
+import cv2;                    print('opencv-headless       ', ver(cv2))
+import albumentations as A;    print('albumentations        ', ver(A))
+import PIL;                    print('Pillow                ', ver(PIL, 'VERSION'))
+import sklearn;                print('scikit-learn          ', ver(sklearn))
+import skimage;                print('scikit-image          ', ver(skimage))
+import scipy;                  print('scipy                 ', ver(scipy))
+import tensorflow_datasets as tfds; print('tensorflow-datasets   ', ver(tfds))
+import onnx;                   print('onnx                  ', ver(onnx))
+import tf2onnx;                print('tf2onnx               ', ver(tf2onnx))
+import onnxruntime as ort;     print('onnxruntime-gpu       ', ver(ort))
+import tensorboard;            print('tensorboard           ', ver(tensorboard))
+import pandas as pd;           print('pandas                ', ver(pd))
+import matplotlib;             print('matplotlib            ', ver(matplotlib))
+import seaborn as sns;         print('seaborn               ', ver(sns))
+import tqdm;                   print('tqdm                  ', ver(tqdm))
+import yaml;                   print('PyYAML                ', ver(yaml))
+import psutil;                 print('psutil                ', ver(psutil))
+import einops;                 print('einops                ', ver(einops))
+import rich;                   print('rich                  ', ver(rich))
+import jupyterlab;             print('jupyterlab            ', ver(jupyterlab))
+
+try:
+    import subprocess
+    r = subprocess.run(
+        ['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader'],
+        capture_output=True, text=True
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        for i, line in enumerate(r.stdout.strip().split('\n')):
+            print(f'  GPU {i}: {line}')
+    else:
+        print('nvidia-smi: no GPU visible (CPU-only build env — OK)')
+except FileNotFoundError:
+    print('nvidia-smi not found in build env — GPU check skipped (expected)')
+
+print('ALL IMPORTS OK')
+"
+
+    cat > /opt/entrypoint.sh << 'ENTRYPOINT'
+#!/bin/bash
+set -euo pipefail
+
+MODE="${1:-help}"
+shift 2>/dev/null || true
+
+GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo 0)
+if [ "$GPU_COUNT" -eq 0 ]; then
+    echo "[WARN] No GPU detected — running in CPU mode"
+fi
+
+_info() {
+    python3 - <<'EOF'
+import sys, tensorflow as tf
+print(f"Python:      {sys.version.split()[0]}")
+print(f"TensorFlow:  {tf.__version__}")
+print(f"Built CUDA:  {tf.test.is_built_with_cuda()}")
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    for g in gpus: print(f"  GPU: {g.name}")
+else:
+    print("No GPU — CPU mode active")
+EOF
+}
+
+case "$MODE" in
+
+  train)
+    SCRIPT=""
+    GPU="0"
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script) SCRIPT="$2"; shift 2 ;;
+        --gpu)    GPU="$2";    shift 2 ;;
+        --)       PASSTHROUGH=true; shift ;;
+        --help|-h) exec /opt/entrypoint.sh help ;;
+        *) echo "[ERROR] Unknown option: $1"; exec /opt/entrypoint.sh help ;;
+      esac
+    done
+    [[ -z "$SCRIPT" ]] && { echo "[ERROR] --script is required."; exec /opt/entrypoint.sh help; }
+    [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+    echo "[INFO] Single-GPU training | GPU=$GPU | script=$SCRIPT"
+    exec python3 "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    ;;
+
+  dist)
+    SCRIPT=""
+    GPUS=""
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script) SCRIPT="$2"; shift 2 ;;
+        --gpus)   GPUS="$2";   shift 2 ;;
+        --)       PASSTHROUGH=true; shift ;;
+        --help|-h) exec /opt/entrypoint.sh help ;;
+        *) echo "[ERROR] Unknown option: $1"; exec /opt/entrypoint.sh help ;;
+      esac
+    done
+    [[ -z "$SCRIPT" ]] && { echo "[ERROR] --script is required."; exec /opt/entrypoint.sh help; }
+    [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+    if [[ -n "$GPUS" ]]; then
+        export CUDA_VISIBLE_DEVICES="$GPUS"
+        echo "[INFO] Multi-GPU | GPUs=$GPUS | script=$SCRIPT"
+    else
+        echo "[INFO] Multi-GPU | GPUs=all visible | script=$SCRIPT"
+    fi
+    echo "[INFO] Script must use tf.distribute.MirroredStrategy()"
+    exec python3 "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    ;;
+
+  export)
+    SCRIPT=""
+    MODEL_PATH=""
+    SAVEDMODEL_OUT=""
+    ONNX_OUT=""
+    OPSET="17"
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script)     SCRIPT="$2";         shift 2 ;;
+        --model)      MODEL_PATH="$2";     shift 2 ;;
+        --savedmodel) SAVEDMODEL_OUT="$2"; shift 2 ;;
+        --onnx)       ONNX_OUT="$2";       shift 2 ;;
+        --opset)      OPSET="$2";          shift 2 ;;
+        --)           PASSTHROUGH=true;    shift ;;
+        --help|-h)    exec /opt/entrypoint.sh help ;;
+        *) echo "[ERROR] Unknown option: $1"; exec /opt/entrypoint.sh help ;;
+      esac
+    done
+    if [[ -n "$SCRIPT" ]]; then
+        [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+        exec python3 "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    fi
+    [[ -z "$MODEL_PATH" ]] && { echo "[ERROR] --model is required."; exec /opt/entrypoint.sh help; }
+    [[ ! -e "$MODEL_PATH" ]] && { echo "[ERROR] Model not found: $MODEL_PATH"; exit 1; }
+    python3 - << PYEOF
+import os, tensorflow as tf
+
+model_path    = "$MODEL_PATH"
+savedmodel_out = "$SAVEDMODEL_OUT"
+onnx_out      = "$ONNX_OUT"
+opset         = int("$OPSET")
+
+print(f"[INFO] Loading model: {model_path}")
+model = tf.keras.models.load_model(model_path)
+model.summary()
+
+if savedmodel_out:
+    os.makedirs(savedmodel_out, exist_ok=True)
+    model.save(savedmodel_out)
+    print(f"[INFO] SavedModel: {savedmodel_out}")
+else:
+    savedmodel_out = "/tmp/tf_savedmodel_export"
+    model.save(savedmodel_out)
+
+if onnx_out:
+    import tf2onnx, onnx
+    os.makedirs(os.path.dirname(os.path.abspath(onnx_out)), exist_ok=True)
+    input_sig = [tf.TensorSpec(inp.shape, inp.dtype, name=inp.name) for inp in model.inputs]
+    tf2onnx.convert.from_keras(model, input_signature=input_sig, opset=opset, output_path=onnx_out)
+    onnx.checker.check_model(onnx_out)
+    print(f"[INFO] ONNX verified: {onnx_out}  ({os.path.getsize(onnx_out)/1024**2:.1f} MB)")
+PYEOF
+    ;;
+
+  jupyter)
+    PORT="8888"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --port) PORT="$2"; shift 2 ;;
+        --help|-h) exec /opt/entrypoint.sh help ;;
+        *) echo "[ERROR] Unknown option: $1"; exec /opt/entrypoint.sh help ;;
+      esac
+    done
+    echo "[INFO] JupyterLab on port $PORT — SSH tunnel: ssh -L ${PORT}:<node>:${PORT} user@login"
+    exec jupyter lab --no-browser --ip=0.0.0.0 --port="$PORT" --notebook-dir=/code
+    ;;
+
+  info)
+    _info
+    ;;
+
+  bash|shell)
+    exec /bin/bash "$@"
+    ;;
+
+  help|--help|-h)
+    cat << 'HELPEOF'
+Usage: apptainer exec --nv <container>.sif [MODE] [ARGS...]
+  train   --script PATH [--gpu ID] [-- ARGS]
+  dist    --script PATH [--gpus IDs] [-- ARGS]
+  export  --model PATH [--savedmodel PATH] [--onnx PATH] [--opset N]
+  jupyter [--port N]
+  info
+  bash
+  <cmd>   passthrough
+Run: apptainer run-help <container>.sif  for full documentation.
+HELPEOF
+    ;;
+
+  *)
+    exec "$MODE" "$@"
+    ;;
+
+esac
+ENTRYPOINT
+    chmod +x /opt/entrypoint.sh
+
+    ldconfig
+
+%environment
+    export PATH=/usr/local/bin:$PATH
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    export PIP_CONSTRAINT=/etc/pip/constraint.txt
+    export HF_HUB_DISABLE_TELEMETRY=1
+    export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
+    export NCCL_DEBUG=WARN
+    export NCCL_IB_DISABLE=0
+    export NO_ALBUMENTATIONS_UPDATE=1
+    export TF_CPP_MIN_LOG_LEVEL=2
+    export TF_ENABLE_ONEDNN_OPTS=0
+
+%startscript
+    mkdir -p /tmp/fw_cache /tmp/hf_cache /tmp/tf_cache
+    export TFHUB_CACHE_DIR=/tmp/tf_cache
+    exec /opt/entrypoint.sh "$@"
+
+%runscript
+    if [ $# -eq 0 ]; then
+        /opt/entrypoint.sh help
+        exec /bin/bash
+    else
+        exec /opt/entrypoint.sh "$@"
+    fi
+
+%help
+================================================================================
+  tensorflow-2.16.1-cuda12.3-train-v1.0.0  v1.0.0
+  TensorFlow 2.16.1 training + inference base. No project code baked in —
+  mount code at /code. Supports single-GPU, multi-GPU MirroredStrategy,
+  SavedModel export, ONNX export. Does NOT include project code or datasets.
+================================================================================
+
+BUILD
+  sudo apptainer build <container>.sif <def-file>.def
+  # rootless:
+  apptainer build --fakeroot <container>.sif <def-file>.def
+
+--------------------------------------------------------------------------------
+BIND POINTS
+--------------------------------------------------------------------------------
+  Container path   Purpose                    Example host path (Lustre)
+  ---------------  -------------------------  ----------------------------------
+  /code            Your project source code   /home/$USER/myproject/code
+  /data            Input datasets             /home/$USER/myproject/data
+  /output          Checkpoints, logs, results /home/$USER/myproject/output
+  /model           Pretrained weights         /home/$USER/myproject/model
+  /scratch         Node-local temp files      $TMPDIR  or  /tmp/scratch
+
+  Auto-mounted by Apptainer (no --bind needed):
+    $HOME  → your Lustre home dir  (venvs, dotfiles, SSH keys persist here)
+    /tmp   → node-local temp
+
+  Multiple binds:
+    --bind /src1:/dst1 --bind /src2:/dst2
+    --bind /src1:/dst1,/src2:/dst2
+
+--------------------------------------------------------------------------------
+APPTAINER FLAGS REFERENCE
+--------------------------------------------------------------------------------
+  --nv                  Pass NVIDIA GPU(s) into container (required for GPU jobs)
+  --bind src:dst        Mount host directory src at container path dst
+  --env KEY=VALUE       Set an environment variable inside the container
+  --writable-tmpfs      Overlay writable tmpfs on top of read-only .sif
+  --no-home             Do NOT auto-mount $HOME (reproducibility tests)
+  --pwd /path           Set working directory inside container at launch
+  --contain             Isolate container from host filesystem
+  --cleanenv            Clear host environment before entering container
+  -H /alt/home          Use an alternate home directory
+
+  EXEC vs RUN vs SHELL:
+    apptainer exec  <container>.sif <cmd>   → run a specific command
+    apptainer run   <container>.sif [args]  → invoke entrypoint (%runscript)
+    apptainer shell <container>.sif         → interactive shell
+
+--------------------------------------------------------------------------------
+ENTRYPOINT MODES
+--------------------------------------------------------------------------------
+
+  TRAIN — single GPU or CPU
+  ──────────────────────────
+  Flags:
+    --script PATH     Python script to run (required)
+    --gpu    ID       GPU device id (default: 0; ignored on CPU-only)
+    -- ARGS           Everything after -- is forwarded to your script
+
+  Examples:
+    apptainer exec --nv \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      --bind /home/$USER/proj/output:/output \
+      <container>.sif train --script /code/train.py -- --epochs 50 --lr 0.001
+
+    # CPU-only node (no --nv)
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      <container>.sif train --script /code/train.py
+
+  DIST — multi-GPU via MirroredStrategy
+  ──────────────────────────────────────
+  Note: TF MirroredStrategy is in-process — no special launcher needed.
+  Your script must use tf.distribute.MirroredStrategy() internally.
+
+  Flags:
+    --script PATH     Training script (required)
+    --gpus  IDs       Comma-separated GPU ids (default: all visible)
+    -- ARGS           Forwarded to your script
+
+  Examples:
+    apptainer exec --nv \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      --bind /home/$USER/proj/output:/output \
+      <container>.sif dist --script /code/train.py --gpus 0,1,2,3 -- --epochs 100
+
+  In your script:
+    strategy = tf.distribute.MirroredStrategy()
+    with strategy.scope():
+        model = build_model()
+        model.compile(...)
+    model.fit(dataset, epochs=100)
+
+  EXPORT — SavedModel + ONNX export
+  ───────────────────────────────────
+  Flags:
+    --model       PATH   Keras .h5 or SavedModel dir (required)
+    --savedmodel  PATH   Output SavedModel directory
+    --onnx        PATH   Output .onnx path (optional)
+    --opset       N      ONNX opset version (default: 17)
+    --script      PATH   Use your own export script instead
+    -- ARGS              Passed to --script
+
+  Examples:
+    apptainer exec --nv \
+      --bind /home/$USER/proj/output:/output \
+      <container>.sif export \
+      --model /output/model.h5 \
+      --savedmodel /output/savedmodel \
+      --onnx /output/model.onnx
+
+  JUPYTER — headless JupyterLab, access via SSH tunnel
+  ──────────────────────────────────────────────────────
+  Flags:
+    --port N    JupyterLab port (default: 8888)
+
+  Examples:
+    apptainer exec --nv --bind /home/$USER:/home/$USER <container>.sif jupyter
+    apptainer exec --nv <container>.sif jupyter --port 8890
+
+  SSH tunnel workflow:
+    1. Launch jupyter inside SLURM job or interactive session on compute node
+    2. Note the compute node hostname (check $SLURM_NODELIST or hostname)
+    3. On your LOCAL machine:
+         ssh -L 8888:<compute-node-hostname>:8888 <username>@<login-node>
+    4. Open http://localhost:8888 in your local browser
+    5. Paste the token printed by the container at startup
+
+  INFO — print environment and hardware details
+  ───────────────────────────────────────────────
+    apptainer exec --nv <container>.sif info
+    apptainer run  --nv <container>.sif info
+
+  BASH — interactive shell
+  ─────────────────────────
+    apptainer exec --nv --bind /home/$USER/proj/code:/code <container>.sif bash
+    apptainer shell --nv --bind /home/$USER/proj/code:/code <container>.sif
+
+  PASSTHROUGH — run any command directly
+  ───────────────────────────────────────
+    apptainer exec --nv <container>.sif python3 /code/eval.py
+    apptainer exec --nv <container>.sif python3 -c "import tensorflow as tf; print(tf.__version__)"
+    apptainer exec <container>.sif pip list
+    apptainer exec <container>.sif python3 -m pytest /code/tests/
+
+--------------------------------------------------------------------------------
+SLURM INTEGRATION
+--------------------------------------------------------------------------------
+  Single-node, 4 GPUs:
+
+    #!/bin/bash
+    #SBATCH --job-name=tf_train
+    #SBATCH --nodes=1
+    #SBATCH --ntasks=1
+    #SBATCH --cpus-per-task=16
+    #SBATCH --gres=gpu:4
+    #SBATCH --mem=64G
+    #SBATCH --time=08:00:00
+    #SBATCH --output=logs/%j.out
+
+    SIF=/home/$USER/containers/<container>.sif
+    CODE=/home/$USER/myproject/code
+    DATA=/home/$USER/myproject/data
+    OUTPUT=/home/$USER/myproject/output
+
+    apptainer exec --nv \
+      --bind $CODE:/code \
+      --bind $DATA:/data \
+      --bind $OUTPUT:/output \
+      $SIF dist --script /code/train.py --gpus 0,1,2,3 -- --epochs 100
+
+  Multi-node, 2 nodes × 4 GPUs (MultiWorkerMirroredStrategy — TF_CONFIG required):
+
+    #!/bin/bash
+    #SBATCH --nodes=2
+    #SBATCH --ntasks-per-node=1
+    #SBATCH --cpus-per-task=16
+    #SBATCH --gres=gpu:4
+    #SBATCH --time=12:00:00
+    #SBATCH --output=logs/%j.out
+
+    SIF=/home/$USER/containers/<container>.sif
+
+    # TF_CONFIG must be set per rank in your job script or launcher
+    srun apptainer exec --nv \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      --bind /home/$USER/proj/output:/output \
+      $SIF python3 /code/train_multiworker.py
+
+  CPU-only node (no --nv, no --gres=gpu):
+
+    #!/bin/bash
+    #SBATCH --nodes=1
+    #SBATCH --ntasks=1
+    #SBATCH --cpus-per-task=32
+    #SBATCH --mem=32G
+    #SBATCH --time=04:00:00
+
+    SIF=/home/$USER/containers/<container>.sif
+
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      $SIF train --script /code/train.py
+
+--------------------------------------------------------------------------------
+TWO-PHASE WORKFLOW
+--------------------------------------------------------------------------------
+  Compute nodes have NO internet access. Prepare all inputs on the login node.
+
+  Phase 1 — Login node (internet available):
+    wget https://example.com/dataset.tar.gz -P /home/$USER/proj/data/
+    huggingface-cli download <model-name> --local-dir /home/$USER/proj/model/
+    git clone https://github.com/yourorg/project /home/$USER/proj/code/
+
+  Phase 2 — Compute node (SLURM job, no internet):
+    --bind /home/$USER/proj/code:/code
+    --bind /home/$USER/proj/data:/data
+    --bind /home/$USER/proj/model:/model
+    --bind /home/$USER/proj/output:/output
+    Container reads from /code, /data, /model; writes to /output.
+
+--------------------------------------------------------------------------------
+USER VENV WORKFLOW  (how to install extra packages)
+--------------------------------------------------------------------------------
+  Create once (login node or interactive session):
+    apptainer exec <container>.sif bash
+    python3 -m venv --system-site-packages $HOME/envs/myenv
+    source $HOME/envs/myenv/bin/activate
+    unset PIP_CONSTRAINT          # REQUIRED — releases the base env lock
+    pip install <your-extra-packages>
+    deactivate
+
+  Use in a SLURM job:
+    apptainer exec --nv \
+      --bind /home/$USER/proj/code:/code \
+      <container>.sif bash -c "
+        source \$HOME/envs/myenv/bin/activate
+        unset PIP_CONSTRAINT
+        python3 /code/train.py
+      "
+
+  Why --system-site-packages?
+    Your venv inherits all packages from the container (TF, numpy, etc.).
+    You only install your extra packages — not the full stack again.
+
+  Why unset PIP_CONSTRAINT?
+    The container locks the base env to prevent silent overwrites.
+    In your venv you own the environment; the lock is not needed.
+
+  Your venvs live in $HOME (Lustre-backed) and survive container updates.
+
+--------------------------------------------------------------------------------
+CUDA DRIVER COMPATIBILITY
+--------------------------------------------------------------------------------
+  Container CUDA   Minimum host driver   Tested driver range
+  ─────────────    ─────────────────────  ───────────────────
+  12.3             525.60 (CUDA 12.1)     525.60 – 550.x+
+
+  Check your host driver: nvidia-smi
+  Container CUDA version must be <= host driver's supported CUDA version.
+
+--------------------------------------------------------------------------------
+CPU FALLBACK
+--------------------------------------------------------------------------------
+  This container runs on CPU-only nodes without modification.
+  - Omit --nv from apptainer exec
+  - Omit --gres=gpu from SBATCH
+  - A warning is printed at startup: "No GPU detected — running in CPU mode"
+  - Test: CUDA_VISIBLE_DEVICES="" apptainer exec <container>.sif info
+
+--------------------------------------------------------------------------------
+NOTE ON DISTRIBUTION
+--------------------------------------------------------------------------------
+  Unlike PyTorch DDP (which requires torchrun), TF MirroredStrategy is
+  purely in-process. No special launcher is needed — python3 script.py
+  is sufficient. For multi-node MultiWorkerMirroredStrategy, your job
+  script must set TF_CONFIG per rank before launching.
+
+--------------------------------------------------------------------------------
+INSTALLED PACKAGES
+--------------------------------------------------------------------------------
+  tensorflow           2.16.1
+  keras                2.16 (bundled with TF 2.16.1)
+  tensorflow-datasets  4.9.6
+  numpy                1.26.4
+  opencv-headless      4.9.0.80
+  albumentations       1.4.6
+  Pillow               10.3.0
+  scikit-learn         1.4.2
+  scikit-image         0.22.0
+  scipy                1.13.1
+  onnx                 1.16.0
+  tf2onnx              1.16.1
+  onnxruntime-gpu      1.18.0
+  tensorboard          2.16.2
+  pandas               2.2.2
+  matplotlib           3.8.4
+  seaborn              0.13.2
+  tqdm                 4.66.5
+  PyYAML               6.0.2
+  psutil               5.9.8
+  einops               0.7.0
+  rich                 13.7.1
+  jupyterlab           4.2.4
+================================================================================

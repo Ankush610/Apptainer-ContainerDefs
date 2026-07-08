@@ -1,0 +1,631 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
+
+%labels
+    Maintainer       Ankush / CDAC Pune
+    Org              CDAC
+    Version          1.1.0
+    Framework        PyTorch 2.2.2
+    CUDA_Version     12.1
+    CUDA_Driver_Min  525.60
+    CUDA_Range       12.1 – 12.4+
+    cuDNN_Version    8
+    Python_Version   3.10
+    CPU_Capable      yes
+    Description      PyTorch 2.2.2 training + inference base. Includes DDP via torchrun, \
+                     ONNX export, JupyterLab. No project code baked in — mount at /code.
+    Modes            train, dist, export, jupyter, info, bash
+
+# NOTE: pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime ships Python 3.10, not 3.11.
+# Upgrade base image to a 3.11-shipping tag when one is available.
+
+%setup
+    mkdir -p ${SINGULARITY_ROOTFS}/etc/apt/apt.conf.d
+    echo 'APT::Sandbox::User "root";' \
+      > ${SINGULARITY_ROOTFS}/etc/apt/apt.conf.d/99sandbox-fix
+
+    mkdir -p ${SINGULARITY_ROOTFS}/code
+    mkdir -p ${SINGULARITY_ROOTFS}/data
+    mkdir -p ${SINGULARITY_ROOTFS}/output
+    mkdir -p ${SINGULARITY_ROOTFS}/model
+    mkdir -p ${SINGULARITY_ROOTFS}/scratch
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        wget curl git unzip zip ca-certificates \
+        ffmpeg libgl1-mesa-glx libgl1 \
+        libglib2.0-0 libsm6 libxrender1 libxext6 \
+        libgomp1 build-essential vim \
+        libibverbs1 librdmacm1 ibverbs-utils
+
+    # pip bootstrap — pin to current stable at build time
+    pip install --no-cache-dir "pip==24.3.1" "setuptools==75.6.0" "wheel==0.45.1"
+
+    # numpy FIRST — torch 2.2 requires numpy <2.0
+    pip install --no-cache-dir "numpy==1.26.4"
+
+    pip install --no-cache-dir \
+        "accelerate==0.30.0" \
+        "timm==0.9.16" \
+        "opencv-python-headless==4.9.0.80" \
+        "albumentations==1.4.6" \
+        "Pillow==10.3.0" \
+        "scikit-learn==1.4.2" \
+        "scikit-image==0.22.0" \
+        "scipy==1.13.1" \
+        "onnx==1.16.0" \
+        "onnxruntime-gpu==1.18.0" \
+        "tensorboard==2.16.2" \
+        "pandas==2.2.2" \
+        "matplotlib==3.8.4" \
+        "seaborn==0.13.2" \
+        "tqdm==4.66.4" \
+        "PyYAML==6.0.1" \
+        "psutil==5.9.8" \
+        "py-cpuinfo==9.0.0" \
+        "einops==0.7.0" \
+        "rich==13.7.1"
+
+    pip install --no-cache-dir "jupyterlab==4.2.3"
+
+    mkdir -p /etc/pip
+    pip freeze > /etc/pip/constraint.txt
+
+    # ── Write entrypoint ──────────────────────────────────────
+    cat > /opt/entrypoint.sh << 'ENTRYPOINT'
+#!/bin/bash
+set -euo pipefail
+
+MODE="${1:-help}"
+shift 2>/dev/null || true
+
+GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo 0)
+
+_info() {
+    python3 - <<'EOF'
+import sys, torch
+print(f"Python    : {sys.version.split()[0]}")
+print(f"PyTorch   : {torch.__version__}")
+print(f"CUDA      : {torch.version.cuda}")
+print(f"cuDNN     : {torch.backends.cudnn.version()}")
+if torch.cuda.is_available():
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        print(f"  GPU {i}   : {p.name}  ({p.total_memory//1024**2} MB)")
+else:
+    print("No GPU — CPU mode active")
+EOF
+}
+
+case "$MODE" in
+
+  train)
+    SCRIPT=""
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script)  SCRIPT="$2"; shift 2 ;;
+        --)        PASSTHROUGH=true; shift ;;
+        --help|-h) exec /opt/entrypoint.sh help ;;
+        *) echo "[ERROR] Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    [[ -z "$SCRIPT" ]]  && { echo "[ERROR] --script is required. Use: train --script PATH"; exit 1; }
+    [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+    [[ "$GPU_COUNT" -eq 0 ]] && echo "[WARN] No GPU detected — running in CPU mode"
+    echo "[INFO] train | script=$SCRIPT"
+    exec python3 "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    ;;
+
+  dist)
+    SCRIPT=""
+    NPROC=""
+    MASTER_PORT="29500"
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script)      SCRIPT="$2";       shift 2 ;;
+        --nproc)       NPROC="$2";        shift 2 ;;
+        --master-port) MASTER_PORT="$2";  shift 2 ;;
+        --)            PASSTHROUGH=true;  shift ;;
+        --help|-h)     exec /opt/entrypoint.sh help ;;
+        *) echo "[ERROR] Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    [[ -z "$SCRIPT" ]]  && { echo "[ERROR] --script is required. Use: dist --script PATH"; exit 1; }
+    [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+    if [[ -z "$NPROC" ]]; then
+        NPROC=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo 1)
+        echo "[INFO] Auto-detected $NPROC GPU(s)"
+    fi
+    [[ "$GPU_COUNT" -eq 0 ]] && echo "[WARN] No GPU detected — running in CPU mode"
+    echo "[INFO] dist | nproc=$NPROC | port=$MASTER_PORT | script=$SCRIPT"
+    exec torchrun \
+        --nproc_per_node="$NPROC" \
+        --master_port="$MASTER_PORT" \
+        "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    ;;
+
+  export)
+    SCRIPT=""
+    CHECKPOINT=""
+    ONNX_OUT=""
+    INPUT_SHAPE="1 3 224 224"
+    MODEL_MODULE=""
+    OPSET="17"
+    SCRIPT_ARGS=()
+    PASSTHROUGH=false
+    while [[ $# -gt 0 ]]; do
+      if $PASSTHROUGH; then SCRIPT_ARGS+=("$1"); shift; continue; fi
+      case "$1" in
+        --script)       SCRIPT="$2";                        shift 2 ;;
+        --checkpoint)   CHECKPOINT="$2";                    shift 2 ;;
+        --output)       ONNX_OUT="$2";                      shift 2 ;;
+        --input-shape)  INPUT_SHAPE="$2 $3 $4 $5";         shift 5 ;;
+        --model-module) MODEL_MODULE="$2";                  shift 2 ;;
+        --opset)        OPSET="$2";                         shift 2 ;;
+        --)             PASSTHROUGH=true;                   shift ;;
+        --help|-h)      exec /opt/entrypoint.sh help ;;
+        *) echo "[ERROR] Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    if [[ -n "$SCRIPT" ]]; then
+        [[ ! -f "$SCRIPT" ]] && { echo "[ERROR] Script not found: $SCRIPT"; exit 1; }
+        exec python3 "$SCRIPT" "${SCRIPT_ARGS[@]}"
+    fi
+    [[ -z "$CHECKPOINT" ]] && { echo "[ERROR] --checkpoint required."; exit 1; }
+    [[ -z "$ONNX_OUT"   ]] && { echo "[ERROR] --output required.";     exit 1; }
+    [[ ! -f "$CHECKPOINT" ]] && { echo "[ERROR] Checkpoint not found: $CHECKPOINT"; exit 1; }
+    echo "[INFO] export | checkpoint=$CHECKPOINT | output=$ONNX_OUT | opset=$OPSET"
+    python3 - << PYEOF
+import torch, onnx, sys, os
+sys.path.insert(0, "/code")
+checkpoint_path = "$CHECKPOINT"
+onnx_out        = "$ONNX_OUT"
+input_shape     = [int(x) for x in "$INPUT_SHAPE".split()]
+opset           = int("$OPSET")
+model_module    = "$MODEL_MODULE"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = None
+if model_module and os.path.isfile(model_module):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("user_model", model_module)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    model = mod.build_model()
+checkpoint = torch.load(checkpoint_path, map_location=device)
+if model is not None:
+    model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+else:
+    model = checkpoint
+model = model.to(device).eval()
+dummy = torch.randn(*input_shape).to(device)
+os.makedirs(os.path.dirname(os.path.abspath(onnx_out)), exist_ok=True)
+torch.onnx.export(
+    model, dummy, onnx_out,
+    opset_version=opset,
+    input_names=["input"], output_names=["output"],
+    dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+)
+onnx.checker.check_model(onnx_out)
+print(f"[INFO] Exported: {onnx_out}  ({os.path.getsize(onnx_out)/1024**2:.1f} MB)")
+PYEOF
+    ;;
+
+  jupyter)
+    PORT="8888"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --port) PORT="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [[ "$GPU_COUNT" -eq 0 ]] && echo "[WARN] No GPU detected — running in CPU mode"
+    echo "[INFO] JupyterLab on port $PORT — SSH tunnel: ssh -L ${PORT}:<node>:${PORT} <user>@<login>"
+    exec jupyter lab \
+        --no-browser \
+        --ip=0.0.0.0 \
+        --port="$PORT" \
+        --notebook-dir=/code \
+        --ServerApp.token='' \
+        --ServerApp.password=''
+    ;;
+
+  info)
+    _info
+    ;;
+
+  bash|shell)
+    exec /bin/bash "$@"
+    ;;
+
+  help|--help|-h)
+    cat << 'HELPEOF'
+Usage: apptainer exec --nv <container>.sif [MODE] [ARGS...]
+
+Modes:
+  train   --script PATH [-- SCRIPT_ARGS]       Single-GPU or CPU training
+  dist    --script PATH [--nproc N] [--master-port N] [-- SCRIPT_ARGS]
+                                                Multi-GPU via torchrun
+  export  --checkpoint PATH --output PATH       ONNX export (built-in)
+          --script PATH                         Delegate to your script
+  jupyter [--port N]                            Headless JupyterLab
+  info                                          Print GPU / env info
+  bash                                          Interactive shell
+  <cmd>                                         Passthrough to any command
+
+Run: apptainer run-help <container>.sif  for full documentation.
+HELPEOF
+    ;;
+
+  *)
+    exec "$MODE" "$@"
+    ;;
+
+esac
+ENTRYPOINT
+    chmod +x /opt/entrypoint.sh
+
+    # ── Smoke test ────────────────────────────────────────────
+    python3 -c "
+import sys
+print('Python:', sys.version.split()[0])
+
+def ver(mod, attr='__version__'):
+    try:
+        v = getattr(mod, attr, None)
+        if v is None:
+            import importlib.metadata
+            v = importlib.metadata.version(mod.__name__)
+        return str(v)
+    except Exception:
+        return '(version unknown)'
+
+import torch;                 print('torch              ', ver(torch))
+import numpy as np;           print('numpy              ', ver(np))
+import cv2;                   print('opencv-headless    ', ver(cv2))
+import albumentations as A;   print('albumentations     ', ver(A))
+import accelerate;            print('accelerate         ', ver(accelerate))
+import timm;                  print('timm               ', ver(timm))
+import sklearn;               print('scikit-learn       ', ver(sklearn))
+import scipy;                 print('scipy              ', ver(scipy))
+import onnx;                  print('onnx               ', ver(onnx))
+import onnxruntime as ort;    print('onnxruntime-gpu    ', ver(ort))
+import tensorboard;           print('tensorboard        ', ver(tensorboard))
+import pandas as pd;          print('pandas             ', ver(pd))
+import einops;                print('einops             ', ver(einops))
+import jupyterlab;            print('jupyterlab         ', ver(jupyterlab))
+import seaborn;               print('seaborn            ', ver(seaborn))
+import PIL;                   print('Pillow             ', ver(PIL, 'VERSION'))
+import skimage;               print('scikit-image       ', ver(skimage))
+import rich;                  print('rich               ', ver(rich))
+import tqdm;                  print('tqdm               ', ver(tqdm))
+import yaml;                  print('PyYAML             ', ver(yaml))
+import psutil;                print('psutil             ', ver(psutil))
+import cpuinfo;               print('py-cpuinfo         ', ver(cpuinfo))
+
+try:
+    import subprocess
+    r = subprocess.run(['nvidia-smi','--query-gpu=name,memory.total','--format=csv,noheader'],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        for i, l in enumerate(r.stdout.strip().split('\n')):
+            print(f'  GPU {i}: {l}')
+    else:
+        print('nvidia-smi: no GPU visible (CPU-only build env — OK)')
+except FileNotFoundError:
+    print('nvidia-smi not found in build env — GPU check skipped (expected)')
+
+print('ALL IMPORTS OK')
+"
+
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+    ldconfig
+    ldconfig -p | grep libGL      || { echo "[ERROR] libGL.so.1 not found";      exit 1; }
+    ldconfig -p | grep libibverbs || { echo "[ERROR] libibverbs.so not found";   exit 1; }
+
+%environment
+    export PATH=/usr/local/bin:$PATH
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    export PIP_CONSTRAINT=/etc/pip/constraint.txt
+    export HF_HUB_DISABLE_TELEMETRY=1
+    export ACCELERATE_DISABLE_RICH=1
+    export NO_ALBUMENTATIONS_UPDATE=1
+    export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
+    export NCCL_DEBUG=WARN
+    export NCCL_IB_DISABLE=0
+
+%startscript
+    mkdir -p /tmp/torch_cache /tmp/hf_cache
+    export TORCH_HOME=/tmp/torch_cache
+    export HF_HOME=/tmp/hf_cache
+    exec /opt/entrypoint.sh "$@"
+
+%runscript
+    if [ $# -eq 0 ]; then
+        /opt/entrypoint.sh help
+        exec /bin/bash
+    else
+        exec /opt/entrypoint.sh "$@"
+    fi
+
+%help
+================================================================================
+  PyTorch 2.2.2 Training + Inference Container  v1.1.0
+  PyTorch 2.2.2  ·  CUDA 12.1  ·  cuDNN 8  ·  Python 3.10
+  Includes: DDP via torchrun, ONNX export, JupyterLab.
+  No project code baked in — mount your code at /code.
+================================================================================
+
+BUILD
+  sudo apptainer build <container>.sif <container>.def
+  apptainer build --fakeroot <container>.sif <container>.def
+
+--------------------------------------------------------------------------------
+BIND POINTS
+--------------------------------------------------------------------------------
+  Container path   Purpose                    Example host path
+  ---------------  -------------------------  ---------------------------------
+  /code            Project source code        /home/$USER/myproject/code
+  /data            Input datasets             /home/$USER/myproject/data
+  /output          Checkpoints, logs          /home/$USER/myproject/output
+  /model           Pretrained weights         /home/$USER/myproject/model
+  /scratch         Node-local temp            $TMPDIR  or  /tmp/scratch
+
+  Auto-mounted by Apptainer (no --bind needed):
+    $HOME  → Lustre home dir  (venvs, dotfiles persist here)
+    /tmp   → node-local temp
+
+--------------------------------------------------------------------------------
+APPTAINER FLAGS
+--------------------------------------------------------------------------------
+  --nv                  Pass NVIDIA GPU(s) into container
+  --bind src:dst        Mount host path at container path
+  --env KEY=VALUE       Set environment variable inside container
+  --writable-tmpfs      Add writable overlay (when a tool must write its own dir)
+  --no-home             Do not auto-mount $HOME (reproducibility tests)
+  --cleanenv            Clear host environment before entering container
+
+  apptainer exec  <container>.sif <cmd>   → run a specific command
+  apptainer run   <container>.sif [args]  → invoke %runscript / entrypoint
+  apptainer shell <container>.sif         → interactive shell
+
+--------------------------------------------------------------------------------
+ENTRYPOINT MODES
+--------------------------------------------------------------------------------
+
+  TRAIN — single GPU or CPU
+  ─────────────────────────
+  Flags:
+    --script PATH     Training script (required)
+    -- ARGS           Forwarded to your script
+
+  Examples:
+    apptainer exec --nv \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      --bind /home/$USER/proj/output:/output \
+      <container>.sif train --script /code/train.py -- --epochs 50
+
+    # CPU-only (no --nv)
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      <container>.sif train --script /code/train.py
+
+  DIST — multi-GPU / multi-node via torchrun
+  ──────────────────────────────────────────
+  Flags:
+    --script PATH       Training script (required)
+    --nproc  N          Number of GPU processes (default: auto-detect via nvidia-smi)
+    --master-port N     Rendezvous port (default: 29500)
+    -- ARGS             Forwarded to your script
+
+  Examples:
+    # 4-GPU single node
+    apptainer exec --nv \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      --bind /home/$USER/proj/output:/output \
+      <container>.sif dist --script /code/train.py --nproc 4 -- --epochs 100
+
+    # Multi-node via srun (see SLURM section)
+    srun apptainer exec --nv \
+      --bind /home/$USER/proj/code:/code \
+      <container>.sif dist --script /code/train.py --nproc 4
+
+  EXPORT — ONNX model export
+  ──────────────────────────
+  Option A — delegate to your own script:
+    <container>.sif export --script /code/export.py
+
+  Option B — built-in generic exporter:
+    <container>.sif export \
+      --checkpoint /output/best.pth \
+      --output     /output/model.onnx \
+      --input-shape 1 3 512 512 \
+      --opset 17
+
+  JUPYTER — headless JupyterLab via SSH tunnel
+  ────────────────────────────────────────────
+  Flags:
+    --port N    Port (default: 8888)
+
+    apptainer exec --nv \
+      --bind /home/$USER/proj/code:/code \
+      <container>.sif jupyter --port 8888
+
+  SSH tunnel from your local machine:
+    ssh -L 8888:<compute-node-hostname>:8888 <username>@<login-node>
+  Then open: http://localhost:8888
+
+  INFO — print environment and GPU inventory
+  ──────────────────────────────────────────
+    apptainer exec --nv <container>.sif info
+
+  BASH — interactive shell
+  ────────────────────────
+    apptainer exec --nv --bind /home/$USER/proj/code:/code <container>.sif bash
+
+  PASSTHROUGH — run any command directly
+  ──────────────────────────────────────
+    apptainer exec --nv <container>.sif python3 /code/eval.py
+    apptainer exec <container>.sif pip list
+
+--------------------------------------------------------------------------------
+SLURM INTEGRATION
+--------------------------------------------------------------------------------
+
+  Single-node, 4 GPUs:
+
+    #!/bin/bash
+    #SBATCH --job-name=pt_train
+    #SBATCH --nodes=1
+    #SBATCH --ntasks=1
+    #SBATCH --cpus-per-task=16
+    #SBATCH --gres=gpu:4
+    #SBATCH --mem=64G
+    #SBATCH --time=08:00:00
+    #SBATCH --output=logs/%j.out
+
+    SIF=/home/$USER/containers/<container>.sif
+    CODE=/home/$USER/myproject/code
+    DATA=/home/$USER/myproject/data
+    OUTPUT=/home/$USER/myproject/output
+
+    apptainer exec --nv \
+      --bind $CODE:/code \
+      --bind $DATA:/data \
+      --bind $OUTPUT:/output \
+      $SIF dist --script /code/train.py --nproc 4 -- --epochs 100
+
+  Multi-node, 2 nodes × 4 GPUs:
+
+    #!/bin/bash
+    #SBATCH --nodes=2
+    #SBATCH --ntasks-per-node=1
+    #SBATCH --cpus-per-task=16
+    #SBATCH --gres=gpu:4
+    #SBATCH --time=12:00:00
+    #SBATCH --output=logs/%j.out
+
+    SIF=/home/$USER/containers/<container>.sif
+
+    srun apptainer exec --nv \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      --bind /home/$USER/proj/output:/output \
+      $SIF dist --script /code/train.py --nproc 4
+
+  CPU-only node:
+
+    #!/bin/bash
+    #SBATCH --nodes=1
+    #SBATCH --ntasks=1
+    #SBATCH --cpus-per-task=32
+    #SBATCH --mem=32G
+    #SBATCH --time=04:00:00
+
+    SIF=/home/$USER/containers/<container>.sif
+
+    apptainer exec \
+      --bind /home/$USER/proj/code:/code \
+      --bind /home/$USER/proj/data:/data \
+      $SIF train --script /code/train.py
+
+--------------------------------------------------------------------------------
+TWO-PHASE WORKFLOW
+--------------------------------------------------------------------------------
+  Compute nodes have NO internet access. Prepare everything on the login node.
+
+  Phase 1 — Login node (internet available):
+    wget https://example.com/dataset.tar.gz -P /home/$USER/proj/data/
+    huggingface-cli download <model> --local-dir /home/$USER/proj/model/
+    git clone https://github.com/yourorg/project /home/$USER/proj/code/
+
+  Phase 2 — Compute node (SLURM job, no internet):
+    Bind /code, /data, /model, /output — container reads and writes from those paths.
+
+--------------------------------------------------------------------------------
+USER VENV WORKFLOW
+--------------------------------------------------------------------------------
+  The base Python is locked via PIP_CONSTRAINT. To install extra packages:
+
+  Create once (login node or interactive session):
+    apptainer exec <container>.sif bash
+    python3 -m venv --system-site-packages $HOME/envs/myenv
+    source $HOME/envs/myenv/bin/activate
+    unset PIP_CONSTRAINT          # REQUIRED — releases the base env lock
+    pip install <your-extra-packages>
+    deactivate
+
+  Use in a SLURM job:
+    apptainer exec --nv \
+      --bind /home/$USER/proj/code:/code \
+      <container>.sif bash -c "
+        source \$HOME/envs/myenv/bin/activate
+        unset PIP_CONSTRAINT
+        python3 /code/train.py
+      "
+
+  Why --system-site-packages?
+    Your venv inherits all container packages. You only install deltas, not the full stack.
+
+  Why unset PIP_CONSTRAINT?
+    The lock protects the base container env. Your venv is yours — unlock it.
+
+  Your venvs live in $HOME (Lustre-backed) and persist across container updates.
+
+--------------------------------------------------------------------------------
+CUDA DRIVER COMPATIBILITY
+--------------------------------------------------------------------------------
+  Container CUDA   Minimum host driver   Tested driver range
+  ─────────────    ─────────────────────  ─────────────────────
+  12.1             525.60                 525.60 – 550.x+
+
+  Check host driver: nvidia-smi
+  Container CUDA version must be <= host driver's supported CUDA version.
+
+--------------------------------------------------------------------------------
+CPU FALLBACK
+--------------------------------------------------------------------------------
+  This container runs on CPU-only nodes without modification.
+    - Omit --nv from apptainer exec
+    - Omit --gres=gpu from SBATCH
+    - A warning is printed at startup: "No GPU detected — running in CPU mode"
+    - Test: CUDA_VISIBLE_DEVICES="" apptainer exec <container>.sif info
+
+--------------------------------------------------------------------------------
+INSTALLED PACKAGES
+--------------------------------------------------------------------------------
+  torch              2.2.2
+  numpy              1.26.4
+  accelerate         0.30.0
+  timm               0.9.16
+  opencv-headless    4.9.0.80
+  albumentations     1.4.6
+  Pillow             10.3.0
+  scikit-learn       1.4.2
+  scikit-image       0.22.0
+  scipy              1.13.1
+  onnx               1.16.0
+  onnxruntime-gpu    1.18.0
+  tensorboard        2.16.2
+  pandas             2.2.2
+  matplotlib         3.8.4
+  seaborn            0.13.2
+  tqdm               4.66.4
+  PyYAML             6.0.1
+  psutil             5.9.8
+  py-cpuinfo         9.0.0
+  einops             0.7.0
+  rich               13.7.1
+  jupyterlab         4.2.3
+================================================================================

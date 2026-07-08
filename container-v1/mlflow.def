@@ -1,0 +1,546 @@
+Bootstrap: docker
+From: python:3.11-slim-bookworm
+
+%labels
+    Maintainer       Ankush / CDAC Pune
+    Org              CDAC
+    Version          1.0.0
+    Framework        MLflow 2.13.2
+    CUDA_Version     N/A
+    CUDA_Driver_Min  N/A
+    CUDA_Range       N/A
+    cuDNN_Version    N/A
+    Python_Version   3.11
+    CPU_Capable      yes
+    Description      MLflow tracking server and experiment management container. Does NOT include PyTorch, TensorFlow, or any training framework — use as a standalone MLflow server or import mlflow in a framework container's venv.
+    Modes            server, ui, run, info, bash
+
+%setup
+    mkdir -p ${SINGULARITY_ROOTFS}/etc/apt/apt.conf.d
+    echo 'APT::Sandbox::User "root";' \
+      > ${SINGULARITY_ROOTFS}/etc/apt/apt.conf.d/99sandbox-fix
+
+    mkdir -p ${SINGULARITY_ROOTFS}/code
+    mkdir -p ${SINGULARITY_ROOTFS}/data
+    mkdir -p ${SINGULARITY_ROOTFS}/output
+    mkdir -p ${SINGULARITY_ROOTFS}/model
+    mkdir -p ${SINGULARITY_ROOTFS}/scratch
+
+%post
+    [ -z "$BASH" ] && exec /bin/bash "$0" "$@"
+    set -euo pipefail
+
+    DEBIAN_FRONTEND=noninteractive apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        wget curl git unzip zip ca-certificates \
+        ffmpeg libgl1-mesa-glx libgl1 \
+        libglib2.0-0 libsm6 libxrender1 libxext6 \
+        libgomp1 build-essential vim
+
+    pip install --upgrade --no-cache-dir pip setuptools wheel
+
+    # numpy first, alone, pinned
+    pip install --no-cache-dir numpy==1.26.4
+
+    # MLflow + tracking extras + server dependencies
+    pip install --no-cache-dir \
+        mlflow==2.13.2 \
+        boto3==1.34.101 \
+        google-cloud-storage==2.16.0 \
+        azure-storage-blob==12.19.1 \
+        psycopg2-binary==2.9.9 \
+        pymysql==1.1.1 \
+        sqlalchemy==2.0.30 \
+        alembic==1.13.1 \
+        gunicorn==22.0.0 \
+        flask==3.0.3 \
+        requests==2.32.2 \
+        pyyaml==6.0.1 \
+        protobuf==4.25.3 \
+        pyarrow==15.0.2 \
+        pandas==2.2.2 \
+        scikit-learn==1.4.2 \
+        scipy==1.13.1 \
+        matplotlib==3.9.0 \
+        Pillow==10.3.0 \
+        click==8.1.7 \
+        rich==13.7.1 \
+        packaging==24.0
+
+    # JupyterLab for interactive use
+    pip install --no-cache-dir jupyterlab==4.2.1
+
+    mkdir -p /etc/pip
+    pip freeze > /etc/pip/constraint.txt
+
+    # Write entrypoint
+    cat > /opt/entrypoint.sh << 'ENTRYEOF'
+#!/bin/bash
+set -euo pipefail
+
+MODE="${1:-help}"
+shift 2>/dev/null || true
+
+GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo 0)
+
+_info() { python3 - <<'EOF'
+import sys, mlflow, numpy, pandas, sklearn
+print(f"Python:     {sys.version.split()[0]}")
+print(f"MLflow:     {mlflow.__version__}")
+print(f"NumPy:      {numpy.__version__}")
+print(f"Pandas:     {pandas.__version__}")
+print(f"scikit-learn: {sklearn.__version__}")
+print("GPU:        N/A (CPU-only container)")
+EOF
+}
+
+case "$MODE" in
+    server)
+        # --host, --port, --backend-store-uri, --default-artifact-root
+        HOST="0.0.0.0"
+        PORT="5000"
+        BACKEND="sqlite:///mlflow.db"
+        ARTIFACT_ROOT="./mlruns"
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --host)           HOST="$2";          shift 2 ;;
+                --port)           PORT="$2";          shift 2 ;;
+                --backend-store-uri) BACKEND="$2";   shift 2 ;;
+                --default-artifact-root) ARTIFACT_ROOT="$2"; shift 2 ;;
+                -h|--help)        exec /opt/entrypoint.sh help ;;
+                *) break ;;
+            esac
+        done
+
+        echo "[mlflow] Starting tracking server on ${HOST}:${PORT}"
+        echo "[mlflow] Backend store: ${BACKEND}"
+        echo "[mlflow] Artifact root: ${ARTIFACT_ROOT}"
+
+        exec mlflow server \
+            --host "${HOST}" \
+            --port "${PORT}" \
+            --backend-store-uri "${BACKEND}" \
+            --default-artifact-root "${ARTIFACT_ROOT}" \
+            "$@"
+        ;;
+
+    ui)
+        # Alias for server mode (mlflow ui = dev server, single user)
+        PORT="5000"
+        HOST="0.0.0.0"
+        BACKEND="sqlite:///mlflow.db"
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --port)  PORT="$2"; shift 2 ;;
+                --host)  HOST="$2"; shift 2 ;;
+                --backend-store-uri) BACKEND="$2"; shift 2 ;;
+                -h|--help) exec /opt/entrypoint.sh help ;;
+                *) break ;;
+            esac
+        done
+
+        echo "[mlflow] Starting UI on ${HOST}:${PORT}"
+        exec mlflow ui --host "${HOST}" --port "${PORT}" \
+            --backend-store-uri "${BACKEND}" "$@"
+        ;;
+
+    run)
+        # Run an MLflow project: --uri, --entry-point, --experiment-name, --tracking-uri
+        SCRIPT=""
+        TRACKING_URI=""
+        EXPERIMENT=""
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --script)         SCRIPT="$2";        shift 2 ;;
+                --tracking-uri)   TRACKING_URI="$2";  shift 2 ;;
+                --experiment)     EXPERIMENT="$2";    shift 2 ;;
+                -h|--help)        exec /opt/entrypoint.sh help ;;
+                --) shift; break ;;
+                *) break ;;
+            esac
+        done
+
+        if [[ -n "$TRACKING_URI" ]]; then
+            export MLFLOW_TRACKING_URI="$TRACKING_URI"
+        fi
+        if [[ -n "$EXPERIMENT" ]]; then
+            export MLFLOW_EXPERIMENT_NAME="$EXPERIMENT"
+        fi
+
+        if [[ -z "$SCRIPT" ]]; then
+            echo "[error] run mode requires --script PATH" >&2
+            exec /opt/entrypoint.sh help
+        fi
+
+        echo "[mlflow] Running script: ${SCRIPT}"
+        [[ -n "$TRACKING_URI" ]] && echo "[mlflow] Tracking URI: ${TRACKING_URI}"
+        exec python3 "${SCRIPT}" "$@"
+        ;;
+
+    jupyter)
+        PORT="8888"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --port) PORT="$2"; shift 2 ;;
+                -h|--help) exec /opt/entrypoint.sh help ;;
+                *) break ;;
+            esac
+        done
+        echo "[jupyter] Starting JupyterLab on port ${PORT} — SSH tunnel required"
+        exec jupyter lab --no-browser --ip=0.0.0.0 --port="${PORT}" \
+            --NotebookApp.token='' --NotebookApp.password=''
+        ;;
+
+    info)  _info ;;
+    bash)  exec /bin/bash ;;
+
+    help|-h|--help)
+        cat << 'HELPEOF'
+Usage: apptainer exec <container>.sif [MODE] [ARGS...]
+
+  server  --host HOST --port PORT --backend-store-uri URI --default-artifact-root PATH
+  ui      --host HOST --port PORT --backend-store-uri URI
+  run     --script PATH [--tracking-uri URI] [--experiment NAME] [-- script_args]
+  jupyter [--port N]
+  info / bash / <cmd>
+
+Run: apptainer run-help <container>.sif  for full docs.
+HELPEOF
+        ;;
+
+    *)  exec "$MODE" "$@" ;;
+esac
+ENTRYEOF
+
+    chmod +x /opt/entrypoint.sh
+
+    # Smoke test
+    python3 -c "
+import sys
+print('Python:', sys.version)
+
+def ver(mod, attr='__version__'):
+    try:
+        v = getattr(mod, attr, None)
+        if v is None:
+            import importlib.metadata
+            v = importlib.metadata.version(mod.__name__)
+        return str(v)
+    except Exception:
+        return '(version unknown)'
+
+def safe_import(name, attr=None):
+    try:
+        import importlib
+        mod = importlib.import_module(name)
+        version = ver(mod, attr) if attr else ver(mod)
+        return mod, version
+    except ImportError:
+        print(f'[WARNING] MISSING package: {name} — not found in container')
+        return None, 'MISSING'
+
+packages = [
+    ('mlflow',          None,       'MLflow          '),
+    ('numpy',           None,       'NumPy           '),
+    ('pandas',          None,       'Pandas          '),
+    ('sklearn',         None,       'scikit-learn    '),
+    ('scipy',           None,       'SciPy           '),
+    ('matplotlib',      None,       'Matplotlib      '),
+    ('PIL',             'VERSION',  'Pillow          '),
+    ('pyarrow',         None,       'PyArrow         '),
+    ('sqlalchemy',      None,       'SQLAlchemy      '),
+    ('alembic',         None,       'Alembic         '),
+    ('flask',           None,       'Flask           '),
+    ('requests',        None,       'Requests        '),
+    ('yaml',            None,       'PyYAML          '),
+    ('boto3',           None,       'boto3           '),
+    ('google.cloud.storage', None,  'GCS             '),
+    ('azure.storage.blob', None,    'Azure Blob      '),
+    ('psycopg2',        None,       'psycopg2        '),
+    ('pymysql',         None,       'PyMySQL         '),
+    ('gunicorn',        None,       'Gunicorn        '),
+    ('click',           None,       'Click           '),
+    ('rich',            None,       'Rich            '),
+    ('packaging',       None,       'Packaging       '),
+    ('jupyterlab',      None,       'JupyterLab      '),
+]
+
+missing = []
+for mod_name, attr, label in packages:
+    _, version = safe_import(mod_name, attr) if attr else safe_import(mod_name)
+    status = version if version != 'MISSING' else 'MISSING <- CHECK MANUALLY'
+    print(f'{label}: {status}')
+    if version == 'MISSING':
+        missing.append(mod_name)
+
+try:
+    import subprocess
+    r = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total',
+                        '--format=csv,noheader'], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        for i, line in enumerate(r.stdout.strip().split('\n')):
+            print(f'  GPU {i}: {line}')
+    else:
+        print('nvidia-smi: no GPU visible in build env — OK (CPU-only container)')
+except FileNotFoundError:
+    print('nvidia-smi not found in build env — expected for CPU-only container')
+
+if missing:
+    print()
+    print('BUILD WARNING: the following packages were not found:')
+    for m in missing:
+        print(f'  - {m}')
+    print('Build continues. Verify manually: apptainer exec <container>.sif info')
+else:
+    print('ALL IMPORTS OK')
+"
+
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+    ldconfig
+
+%environment
+    export PATH=/usr/local/bin:$PATH
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    export PIP_CONSTRAINT=/etc/pip/constraint.txt
+    export HF_HUB_DISABLE_TELEMETRY=1
+    export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
+    export MPLBACKEND=Agg
+
+%startscript
+    [ -z "$BASH" ] && exec /bin/bash "$0" "$@"
+    mkdir -p /tmp/fw_cache /tmp/mlflow_tmp
+    export TMPDIR=/tmp/mlflow_tmp
+    exec /opt/entrypoint.sh "$@"
+
+%runscript
+    [ -z "$BASH" ] && exec /bin/bash "$0" "$@"
+    if [ $# -eq 0 ]; then
+        /opt/entrypoint.sh help
+        exec /bin/bash
+    else
+        exec /opt/entrypoint.sh "$@"
+    fi
+
+%help
+================================================================================
+  MLflow Tracking Container  v1.0.0
+  MLflow tracking server, experiment UI, and run execution. Does NOT include
+  PyTorch, TensorFlow, or any GPU training framework.
+================================================================================
+
+BUILD
+  sudo apptainer build mlflow-2.13.2-cuda12.1-tracking-v1.0.0.sif mlflow-2.13.2-cuda12.1-tracking-v1.0.0.def
+  apptainer build --fakeroot mlflow-2.13.2-cuda12.1-tracking-v1.0.0.sif mlflow-2.13.2-cuda12.1-tracking-v1.0.0.def
+
+--------------------------------------------------------------------------------
+BIND POINTS
+--------------------------------------------------------------------------------
+  /code    Project source code    /lustre/$USER/myproject/code
+  /data    Input datasets         /lustre/$USER/myproject/data
+  /output  MLflow run artifacts   /lustre/$USER/myproject/output
+  /model   Exported models        /lustre/$USER/myproject/model
+  /scratch Node-local temp        $TMPDIR or /tmp/scratch
+  $HOME and /tmp auto-mounted by Apptainer.
+
+  Recommended: bind your mlruns directory to /output/mlruns so artifacts persist.
+
+--------------------------------------------------------------------------------
+APPTAINER FLAGS
+--------------------------------------------------------------------------------
+  --nv                Pass NVIDIA GPU(s) into container
+  --bind src:dst      Mount host path at container path
+  --env KEY=VALUE     Set env var inside container
+  --writable-tmpfs    Writable overlay on read-only .sif
+  --no-home           Do not auto-mount $HOME
+  --cleanenv          Clear host environment before entering
+
+  exec  → run specific command   run   → invoke %runscript   shell → interactive
+
+--------------------------------------------------------------------------------
+ENTRYPOINT MODES
+--------------------------------------------------------------------------------
+
+  server  — Production MLflow tracking server (gunicorn-backed)
+    Flags: --host HOST (default: 0.0.0.0)
+           --port PORT (default: 5000)
+           --backend-store-uri URI (default: sqlite:///mlflow.db)
+           --default-artifact-root PATH (default: ./mlruns)
+
+    Example (SQLite backend, artifacts on Lustre):
+      apptainer exec \
+        --bind /lustre/$USER/mlflow:/output \
+        <container>.sif server \
+        --backend-store-uri sqlite:////output/mlflow.db \
+        --default-artifact-root /output/mlruns
+
+    Example (PostgreSQL backend):
+      apptainer exec \
+        --env MLFLOW_TRACKING_URI=postgresql://user:pass@db-host/mlflow \
+        <container>.sif server \
+        --backend-store-uri postgresql://user:pass@db-host/mlflow \
+        --default-artifact-root s3://my-bucket/mlruns
+
+  ui  — Lightweight single-user MLflow UI (dev use)
+    Flags: --host HOST (default: 0.0.0.0)
+           --port PORT (default: 5000)
+           --backend-store-uri URI (default: sqlite:///mlflow.db)
+
+    Example:
+      apptainer exec \
+        --bind /lustre/$USER/mlflow:/output \
+        <container>.sif ui \
+        --backend-store-uri sqlite:////output/mlflow.db
+
+  run  — Execute a Python training script with MLflow tracking
+    Flags: --script PATH          (required)
+           --tracking-uri URI     (sets MLFLOW_TRACKING_URI)
+           --experiment NAME      (sets MLFLOW_EXPERIMENT_NAME)
+           -- [script args]
+
+    Example:
+      apptainer exec \
+        --bind /lustre/$USER/myproject:/code \
+        --bind /lustre/$USER/mlflow:/output \
+        <container>.sif run \
+        --script /code/train.py \
+        --tracking-uri http://login-node:5000 \
+        --experiment my_experiment \
+        -- --epochs 50 --lr 0.001
+
+  jupyter  — Headless JupyterLab server (SSH tunnel required)
+    Flags: --port N (default: 8888)
+
+    Example:
+      apptainer exec \
+        --bind /lustre/$USER/myproject:/code \
+        <container>.sif jupyter --port 8889
+
+    Then from your workstation:
+      ssh -L 8889:compute-node:8889 user@login-node
+      Open: http://localhost:8889
+
+  info  — Print package versions and runtime info
+      apptainer exec <container>.sif info
+
+  bash  — Interactive shell
+      apptainer exec <container>.sif bash
+
+  <cmd>  — Passthrough: run any command directly
+      apptainer exec <container>.sif mlflow --version
+      apptainer exec <container>.sif python3 /code/script.py
+
+--------------------------------------------------------------------------------
+SLURM INTEGRATION
+--------------------------------------------------------------------------------
+
+  # Single-node CPU job — MLflow tracking server
+  #SBATCH --job-name=mlflow-server
+  #SBATCH --ntasks=1
+  #SBATCH --cpus-per-task=4
+  #SBATCH --mem=8G
+  #SBATCH --time=08:00:00
+
+  apptainer exec \
+    --bind /lustre/$USER/mlflow:/output \
+    <container>.sif server \
+    --backend-store-uri sqlite:////output/mlflow.db \
+    --default-artifact-root /output/mlruns \
+    --port 5000
+
+  ---
+
+  # CPU training job with remote MLflow tracking
+  #SBATCH --job-name=mlflow-run
+  #SBATCH --ntasks=1
+  #SBATCH --cpus-per-task=8
+  #SBATCH --mem=16G
+  #SBATCH --time=04:00:00
+
+  apptainer exec \
+    --bind /lustre/$USER/myproject/code:/code \
+    --bind /lustre/$USER/myproject/data:/data \
+    --bind /lustre/$USER/myproject/output:/output \
+    --env MLFLOW_TRACKING_URI=http://login-node:5000 \
+    <container>.sif run \
+    --script /code/train.py \
+    --experiment slurm_run_$SLURM_JOB_ID
+
+  ---
+
+  # GPU training job (use this container only for mlflow; framework container for training)
+  # Recommended: run mlflow.start_run() from within your PyTorch/TF container via venv
+
+--------------------------------------------------------------------------------
+TWO-PHASE WORKFLOW
+--------------------------------------------------------------------------------
+  Phase 1 (login node): download data/code to Lustre; optionally start tracking server
+  Phase 2 (compute node): bind Lustre paths, run training — no network calls needed
+    → Set MLFLOW_TRACKING_URI to a login-node address accessible from compute nodes
+
+--------------------------------------------------------------------------------
+JUPYTERLAB SSH TUNNEL
+--------------------------------------------------------------------------------
+  1. Start container on compute node (via SLURM interactive or batch):
+       apptainer exec --bind /lustre/$USER:/code <container>.sif jupyter --port 8888
+  2. From your workstation:
+       ssh -N -L 8888:<compute-node-hostname>:8888 <user>@<login-node>
+  3. Open browser: http://localhost:8888
+
+--------------------------------------------------------------------------------
+USER VENV WORKFLOW
+--------------------------------------------------------------------------------
+  apptainer exec <container>.sif bash
+  python3 -m venv --system-site-packages $HOME/envs/mlflow-ext
+  source $HOME/envs/mlflow-ext/bin/activate
+  unset PIP_CONSTRAINT    # required — releases base env lock
+  pip install <extra-packages>
+
+  venvs live in $HOME (Lustre-backed), survive container updates.
+
+--------------------------------------------------------------------------------
+CUDA DRIVER COMPATIBILITY
+--------------------------------------------------------------------------------
+  N/A — CPU-only container.
+  To track GPU training jobs, run this container on a login/head node as a
+  tracking server; the GPU training container connects to it via MLFLOW_TRACKING_URI.
+
+--------------------------------------------------------------------------------
+CPU FALLBACK
+--------------------------------------------------------------------------------
+  This is a CPU-only container. --nv flag is not required.
+  Test: apptainer exec <container>.sif info
+
+--------------------------------------------------------------------------------
+INSTALLED PACKAGES
+--------------------------------------------------------------------------------
+  [Fill with actual pinned versions after build: apptainer exec <container>.sif pip freeze]
+
+  Key packages (nominal versions at def authoring time):
+    mlflow            2.13.2
+    numpy             1.26.4
+    pandas            2.2.2
+    scikit-learn      1.4.2
+    scipy             1.13.1
+    matplotlib        3.9.0
+    Pillow            10.3.0
+    pyarrow           15.0.2
+    sqlalchemy        2.0.30
+    alembic           1.13.1
+    flask             3.0.3
+    gunicorn          22.0.0
+    requests          2.32.2
+    pyyaml            6.0.1
+    boto3             1.34.101
+    google-cloud-storage 2.16.0
+    azure-storage-blob   12.19.1
+    psycopg2-binary   2.9.9
+    pymysql           1.1.1
+    click             8.1.7
+    rich              13.7.1
+    packaging         24.0
+    jupyterlab        4.2.1
+================================================================================
