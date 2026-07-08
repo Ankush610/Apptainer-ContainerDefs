@@ -1,0 +1,383 @@
+Bootstrap: docker
+From: python:3.11-slim
+# Base-image-first: classical ML + MLflow tracking is CPU-only, no CUDA/GPU
+# stack needed. python:3.11-slim keeps the image lean.
+
+%labels
+    Author        CDAC Pune
+    Maintainer    hpcsupport@cdac.in
+    Version       1.0
+    Stack         classical-ml-mlflow
+    BaseImage     python:3.11-slim
+    CUDA          none
+    Description   Classical ML (sklearn/xgboost/lightgbm) + MLflow tracking, same container
+    BuildDate     2026-07-07
+
+%setup
+    # Nothing needed on the host before the container filesystem exists.
+
+%files
+    # No files copied in — project code is mounted at runtime, not baked in.
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    # --- standard mount points (house convention, always identical) ---
+    mkdir -p /code /data /output /model /scratch
+
+    # --- OS-level extras the base image lacks ---
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    # --- Python stack (pin versions) ---
+    pip install --no-cache-dir --upgrade pip
+
+    # Data handling / preprocessing
+    pip install --no-cache-dir \
+        numpy==1.26.4 \
+        pandas==2.2.2 \
+        pyarrow==17.0.0 \
+        scikit-learn==1.5.1 \
+        category_encoders==2.6.3
+
+    # Training algorithms (structured/tabular)
+    pip install --no-cache-dir \
+        xgboost==2.1.1 \
+        lightgbm==4.5.0
+
+    # Experiment tracking — same container runs the server AND your
+    # training code, so `import mlflow` works without a second image.
+    pip install --no-cache-dir \
+        mlflow==2.16.2 \
+        psutil==6.0.0
+
+    # Visualization
+    pip install --no-cache-dir \
+        matplotlib==3.9.2 \
+        seaborn==0.13.2 \
+        plotly==5.24.0
+
+    # Notebook / utilities
+    pip install --no-cache-dir \
+        jupyterlab==4.2.5 \
+        tqdm==4.66.5 \
+        pyyaml==6.0.2
+
+    # --- freeze the environment: protects base stack from user upgrades ---
+    pip freeze > /opt/base-constraints.txt
+
+    # --- cleanup ---
+    pip cache purge || true
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    # Lock in-container pip installs to the shipped versions.
+    # Users building their own venv are told in %help to unset this.
+    export PIP_CONSTRAINT=/opt/base-constraints.txt
+
+    # MLflow tracking defaults — all overridable with --env at runtime.
+    export MLFLOW_BACKEND_STORE_URI="sqlite:////output/mlflow.db"
+    export MLFLOW_ARTIFACT_ROOT="/output/artifacts"
+    export MLFLOW_PORT="5000"
+    export MLFLOW_TRACKING_URI="${MLFLOW_BACKEND_STORE_URI}"
+
+    # Jupyter defaults
+    export JUPYTER_PORT="8888"
+
+%test
+    #!/bin/sh
+    echo "== Python stack =="
+    python -c "import numpy, pandas, sklearn, xgboost, lightgbm; print('training stack OK')"
+    python -c "import mlflow; print('mlflow', mlflow.__version__)"
+    echo "== No GPU dependency =="
+    echo "This container is CPU-only by design — no GPU check needed."
+
+%runscript
+    # Named built-in modes. Keep in sync with %help "WHAT YOU CAN RUN".
+    MODE="${1:-jupyter}"
+    [ "$#" -gt 0 ] && shift
+    mkdir -p "${MLFLOW_ARTIFACT_ROOT}" 2>/dev/null || true
+
+    start_mlflow() {
+        mlflow server \
+            --backend-store-uri "${MLFLOW_BACKEND_STORE_URI}" \
+            --default-artifact-root "${MLFLOW_ARTIFACT_ROOT}" \
+            --host 0.0.0.0 \
+            --port "${MLFLOW_PORT}" &
+    }
+
+    case "$MODE" in
+        jupyter)
+            exec jupyter lab --ip=0.0.0.0 --port="${JUPYTER_PORT}" \
+                 --no-browser --allow-root "$@"
+            ;;
+        mlflow)
+            exec mlflow server \
+                 --backend-store-uri "${MLFLOW_BACKEND_STORE_URI}" \
+                 --default-artifact-root "${MLFLOW_ARTIFACT_ROOT}" \
+                 --host 0.0.0.0 \
+                 --port "${MLFLOW_PORT}" "$@"
+            ;;
+        jupyter+mlflow)
+            start_mlflow
+            exec jupyter lab --ip=0.0.0.0 --port="${JUPYTER_PORT}" \
+                 --no-browser --allow-root "$@"
+            ;;
+        help|--help|-h)
+            exec apptainer help "$APPTAINER_CONTAINER" 2>/dev/null || \
+                 echo "Run: apptainer run-help <sif>"
+            ;;
+        *)
+            echo "Unknown mode: $MODE"
+            echo "Available modes: jupyter | mlflow | jupyter+mlflow"
+            echo "For CLI/ad-hoc commands use: apptainer exec ... <sif> python /code/train.py"
+            exit 1
+            ;;
+    esac
+
+%startscript
+    # For `apptainer instance start` — long-lived tracking server across
+    # job lifetimes, independent of any one training job.
+    MODE="${1:-mlflow}"
+    [ "$#" -gt 0 ] && shift
+    case "$MODE" in
+        mlflow)
+            exec mlflow server \
+                 --backend-store-uri "${MLFLOW_BACKEND_STORE_URI}" \
+                 --default-artifact-root "${MLFLOW_ARTIFACT_ROOT}" \
+                 --host 0.0.0.0 \
+                 --port "${MLFLOW_PORT}" "$@"
+            ;;
+        *)
+            echo "Unknown instance mode: $MODE" >&2
+            exit 1
+            ;;
+    esac
+
+%help
+    ================================================================================
+      WELCOME TO THE CLASSICAL-ML + MLFLOW CONTAINER
+    ================================================================================
+    A CPU container for structured/tabular ML: training (scikit-learn, xgboost,
+    lightgbm), preprocessing, data handling, visualization — with MLflow
+    tracking built into the SAME container, so `import mlflow` works right
+    alongside your training code with no second container needed.
+    scikit-learn 1.5.1 · xgboost 2.1.1 · lightgbm 4.5.0 · mlflow 2.16.2 ·
+    Python 3.11. CPU-only, no GPU required.
+    No project code baked in — mount your own code at /code.
+
+    New to Apptainer? Three commands you'll use:
+      apptainer run   <sif>   → just run it, easiest way to start
+      apptainer exec  <sif> X → run a specific command X inside it
+      apptainer shell <sif>   → drop into an interactive shell to look around
+
+
+    ================================================================================
+      QUICK START
+    ================================================================================
+      apptainer run container.sif
+
+    (No --nv needed — this container is CPU-only.)
+
+
+    ================================================================================
+      FLAGS YOU'LL ACTUALLY USE
+    ================================================================================
+      --bind src:dst        Make a folder on your machine visible inside the
+                            container at path dst. This is how the container
+                            sees your code, data, and writes results (and the
+                            MLflow DB/artifacts) back out. Repeat the flag to
+                            bind more than one folder:
+                              --bind /my/code:/code --bind /my/output:/output
+
+      --env KEY=VALUE       Set an environment variable inside the container
+                            for this run only, e.g. --env MLFLOW_PORT=5001
+
+      (This container has no GPU dependency, so --nv / --rocm are not needed.
+      Everything else Apptainer offers is optional — you likely won't need it.
+      For the full list, see official help: apptainer help exec)
+
+
+    ================================================================================
+      DIRECTORIES INSIDE THE CONTAINER
+    ================================================================================
+    These paths already exist inside the container, empty by default — bind your
+    own folders onto them so the container can read your files and write results:
+
+      /code            your training/preprocessing scripts
+      /data            your input datasets
+      /output          trained models, plots, logs, and MLflow's mlflow.db +
+                       artifacts/ all get written here
+      /model           saved models, if you have any
+      /scratch         node-local scratch space (temp files, not kept)
+
+      Also automatically available, no --bind needed:
+      $HOME            your normal home directory
+      /tmp             temp space
+
+
+    ================================================================================
+      WHAT YOU CAN RUN
+    ================================================================================
+    Three ways to use this container: run it plainly, exec a specific task, or
+    shell in to work interactively.
+
+      RUN — start the container's built-in mode
+      -------------------------------------------------------
+      What it does: launches one of the built-in modes below. You don't point
+      it at a script — it just starts.
+
+      apptainer run --bind /my/code:/code --bind /my/output:/output container.sif jupyter
+
+      jupyter (default)     JupyterLab, for interactive notebooks —
+                            `import mlflow` works out of the box
+        apptainer run --bind /my/code:/code --bind /my/data:/data \
+          --bind /my/output:/output container.sif jupyter
+
+      mlflow                MLflow tracking server + UI only, nothing else
+        apptainer run --bind /my/output:/output container.sif mlflow
+
+      jupyter+mlflow         Both at once — server in the background, JupyterLab
+                            in the foreground
+        apptainer run --bind /my/code:/code --bind /my/output:/output \
+          container.sif jupyter+mlflow
+
+      Running with no mode at all uses the default (jupyter). To be explicit,
+      always pass the mode you want.
+
+      EXEC — run your own commands and scripts
+      --------------------------------
+      What it does: runs a single command, or one of your own scripts (like
+      train.py), inside the container. This is how you actually do work — bind
+      in your code and data, set any env vars you need, and point exec at what
+      to run.
+
+      apptainer exec --bind <your binds> container.sif <command> [ARGS...]
+
+      TRAIN — run your own training script (logs to MLflow via /output)
+        apptainer exec --bind /my/code:/code --bind /my/data:/data \
+          --bind /my/output:/output container.sif python /code/train.py
+
+      MLFLOW CLI — inspect runs without starting the full server
+        apptainer exec --bind /my/output:/output container.sif mlflow runs list
+
+      JUPYTER (manual) — notebook server, reachable via SSH tunnel
+        apptainer exec --bind /my/code:/code container.sif \
+          jupyter lab --ip=0.0.0.0 --no-browser --port=8888
+        # then from your laptop:
+        ssh -L 8888:<compute-node>:8888 <you>@<login-node>
+        # open http://localhost:8888
+
+      MLFLOW UI (manual) — same idea, tunnel the tracking port instead
+        apptainer exec --bind /my/output:/output container.sif \
+          mlflow server --backend-store-uri sqlite:////output/mlflow.db \
+          --default-artifact-root /output/artifacts --host 0.0.0.0 --port 5000
+        # then: ssh -L 5000:<compute-node>:5000 <you>@<login-node>
+        # open http://localhost:5000
+
+      ENV VAR example — e.g. limiting threads for reproducible CPU runs
+        apptainer exec --env OMP_NUM_THREADS=4 --bind /my/code:/code \
+          --bind /my/output:/output container.sif python /code/train.py
+
+      SHELL — drop into an interactive prompt
+      --------------------------------
+      What it does: starts an interactive shell inside the container.
+      No command or script is executed automatically. Useful for
+      inspecting the environment, checking installed packages, or
+      running commands manually.
+
+      apptainer shell \
+        --bind /my/code:/code \
+        --bind /my/output:/output \
+      container.sif
+
+      You're now inside the container. Type `exit` to leave.
+
+
+    ================================================================================
+      RUNNING ON THE CLUSTER (SLURM)
+    ================================================================================
+    Classical ML training here is single-process, single-node (no distributed
+    training needed for structured/tabular algorithms). A simple CPU batch job:
+
+      #!/bin/bash
+      #SBATCH --job-name=classical-ml-mlflow-train
+      #SBATCH --cpus-per-task=8
+      #SBATCH --mem=32G
+      #SBATCH --time=02:00:00
+
+      srun apptainer exec \
+        --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+        container.sif python /code/train.py
+
+    If your algorithm supports internal parallelism (xgboost/lightgbm both do),
+    just size --cpus-per-task to match and let the library use all cores; there's
+    no multi-node launcher involved for this stack.
+
+    Each job's /output bind gets its own mlflow.db by default — fine for
+    isolated runs. If you want one tracking server shared across several jobs
+    instead, start it standalone first and point every job at it:
+      srun apptainer run --bind /my/output:/output container.sif mlflow &
+      export MLFLOW_TRACKING_URI=http://<server-node>:5000
+    Find <server-node> from the job's allocation: squeue -j <jobid> -o "%N"
+
+
+    ================================================================================
+      INSTALLING EXTRA PACKAGES
+    ================================================================================
+    You can `pip install` something new right inside a running container — it
+    will work for that session. But the container filesystem resets on every
+    fresh run, so anything you installed is gone the next time you start it,
+    unless you do one of the following:
+
+      METHOD 1: Overlay (quick, one-off)
+      --------------------------------
+        apptainer overlay create --size 1024 overlay.img
+        apptainer shell --overlay overlay.img --bind /my/code:/code container.sif
+        pip install <package>
+      Reuse the same overlay.img next time to see it again.
+
+      METHOD 2: venv in $HOME (cleaner, long-term)
+      --------------------------------
+        python3 -m venv --system-site-packages $HOME/envs/myenv
+        source $HOME/envs/myenv/bin/activate
+        unset PIP_CONSTRAINT
+        pip install <package>
+      Next time: just `source $HOME/envs/myenv/bin/activate`. Persists
+      automatically — $HOME is your real disk, not the container.
+      --system-site-packages keeps the base stack (numpy, pandas,
+      scikit-learn, xgboost, lightgbm, mlflow, etc.) visible. unset
+      PIP_CONSTRAINT releases the base image's package lock.
+
+      METHOD 3: unset the lock, skip the venv
+      --------------------------------
+        unset PIP_CONSTRAINT
+        pip install <package>
+      Lands in ~/.local/lib/python3.11/site-packages, persists the same way.
+      The unset is per-shell — add it to your venv's activate script (or
+      $HOME/.bashrc, if you always want it off) so you're not retyping it.
+
+      HEADS UP
+      --------------------------------
+      - Not every container sets PIP_CONSTRAINT — depends on the base image.
+        Check: apptainer exec container.sif env | grep PIP_CONSTRAINT
+      - Overlay write targets also vary by base image (system site-packages
+        vs conda vs baked-in venv). Overlay install fails? Check the target:
+        apptainer exec --overlay overlay.img container.sif pip show -f <package> | grep Location
+
+
+    ================================================================================
+      CHECKING IT WORKS
+    ================================================================================
+      apptainer test container.sif
+
+    Runs a quick built-in check that imports numpy, pandas, scikit-learn,
+    xgboost, lightgbm, matplotlib, and mlflow (with version print). If it
+    passes, you're good to go. No GPU check applies — this container is
+    CPU-only by design.
+    ================================================================================

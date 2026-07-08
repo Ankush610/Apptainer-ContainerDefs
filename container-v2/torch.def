@@ -1,0 +1,358 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:26.04-py3
+# Base-image-first: official NGC image. Tag 26.04 ships CUDA 13.2.1, matching
+# Param Shavak's CUDA 13 stack (RTX 5000 Ada / RTX A400). Already includes
+# torch, torchvision, APEX, cuDNN, NCCL, RDMA/IB userspace libs, JupyterLab,
+# tensorboard — %post only adds project extras.
+
+%labels
+    Author        CDAC Pune 
+    Maintainer    hpcsupport@cdac.in
+    Version       1.0
+    Stack         pytorch
+    BaseImage     nvcr.io/nvidia/pytorch:26.04-py3
+    CUDA          13.2.1
+    Description   PyTorch training/inference container for Param Shavak
+    BuildDate     2026-07-06
+
+%setup
+    # Runs on the HOST before the container filesystem exists. Not needed here.
+
+%files
+    # No files copied in — no project code baked into the image.
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    # --- standard mount points (house convention, always identical) ---
+    mkdir -p /code /data /output /model /scratch
+
+    # --- OS-level extras the base image lacks (keep minimal) ---
+    # NGC PyTorch 26.04 already ships everything needed here; nothing to add.
+
+    # --- Python extras on top of the base stack (pin versions) ---
+    pip install --no-cache-dir \
+        jupyterlab==4.5.6 \
+        tensorboard==2.18.0 \
+        transformers==4.48.0 \
+        datasets==3.6.0 \
+        accelerate==1.2.1
+
+    # --- freeze the environment: protects base stack from user upgrades ---
+    pip freeze > /opt/base-constraints.txt
+
+    # --- cleanup ---
+    pip cache purge || true
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    # Lock in-container pip installs to the shipped versions.
+    # Users building their own venv are told in %help to unset this.
+    export PIP_CONSTRAINT=/opt/base-constraints.txt
+
+    # Safe, fabric-neutral defaults ONLY (see networking.md).
+    # Do NOT set NCCL_IB_DISABLE / NCCL_SOCKET_IFNAME here — those are
+    # per-cluster overrides documented in %help.
+    export NCCL_DEBUG=WARN
+
+    # Persist HF downloads on a bound path instead of the ephemeral image.
+    export HF_HOME=/model/hf-cache
+
+%test
+    #!/bin/sh
+    echo "== Python stack =="
+    python -c "import torch; print('torch', torch.__version__)"
+    python -c "import transformers, datasets, accelerate; print('transformers', transformers.__version__); print('datasets', datasets.__version__); print('accelerate', accelerate.__version__)"
+    echo "== GPU visibility =="
+    if python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
+        python -c "import torch; print('CUDA OK:', torch.cuda.get_device_name(0))"
+    else
+        echo "WARNING: no GPU visible. Fine on a CPU host / missing --nv."
+        echo "         On a GPU node, run: apptainer test --nv <sif>"
+    fi
+
+%runscript
+    # Named built-in modes. Keep in sync with %help "WHAT YOU CAN RUN".
+    MODE="${1:-jupyter}"
+    [ "$#" -gt 0 ] && shift
+    case "$MODE" in
+        jupyter)
+            exec jupyter lab --ip=0.0.0.0 --no-browser --port="${JUPYTER_PORT:-8888}" \
+                 --notebook-dir=/code "$@"
+            ;;
+        tensorboard)
+            exec tensorboard --logdir=/output --host=0.0.0.0 \
+                 --port="${TB_PORT:-6006}" "$@"
+            ;;
+        jupyter+tensorboard)
+            tensorboard --logdir=/output --host=0.0.0.0 --port="${TB_PORT:-6006}" &
+            exec jupyter lab --ip=0.0.0.0 --no-browser --port="${JUPYTER_PORT:-8888}" \
+                 --notebook-dir=/code "$@"
+            ;;
+        help|--help|-h)
+            exec apptainer help "$APPTAINER_CONTAINER" 2>/dev/null || \
+                 echo "Run: apptainer run-help <sif>"
+            ;;
+        *)
+            echo "Unknown mode: $MODE"
+            echo "Available modes: jupyter | tensorboard | jupyter+tensorboard"
+            echo "For your own scripts use: apptainer exec ... <sif> python /code/yourscript.py"
+            exit 1
+            ;;
+    esac
+
+%startscript
+    # For `apptainer instance start`. Mirror the long-running runscript modes.
+    MODE="${1:-jupyter}"
+    [ "$#" -gt 0 ] && shift
+    case "$MODE" in
+        jupyter)
+            exec jupyter lab --ip=0.0.0.0 --no-browser --port="${JUPYTER_PORT:-8888}" \
+                 --notebook-dir=/code "$@"
+            ;;
+        tensorboard)
+            exec tensorboard --logdir=/output --host=0.0.0.0 --port="${TB_PORT:-6006}" "$@"
+            ;;
+        *)
+            echo "Unknown instance mode: $MODE" >&2
+            exit 1
+            ;;
+    esac
+
+%help
+    ================================================================================
+      WELCOME TO THE PYTORCH CONTAINER
+    ================================================================================
+    A GPU container for PyTorch training, inference, fine-tuning, and
+    Hugging Face workflows (transformers, datasets, accelerate).
+    PyTorch (NGC 26.04) · CUDA 13.2.1 · Python 3.x. Runs on GPU or CPU.
+    No project code baked in — mount your own code at /code.
+
+    New to Apptainer? Three commands you'll use:
+      apptainer run   <sif>   → just run it, easiest way to start
+      apptainer exec  <sif> X → run a specific command X inside it
+      apptainer shell <sif>   → drop into an interactive shell to look around
+
+
+    ================================================================================
+      QUICK START
+    ================================================================================
+      apptainer run --nv container.sif
+
+    (--nv gives it access to your GPU. Leave it out on a machine with no GPU.)
+
+
+    ================================================================================
+      FLAGS YOU'LL ACTUALLY USE
+    ================================================================================
+      --nv                  Give the container access to your GPU(s).
+                            Use it any time you're doing GPU work (NVIDIA).
+
+      --rocm                Same idea as --nv, but for AMD GPUs.
+                            Use it instead of --nv on ROCm-based systems.
+
+      --bind src:dst        Make a folder on your machine visible inside the
+                            container at path dst. This is how the container
+                            sees your code, data, and writes results back out.
+                            Repeat the flag to bind more than one folder:
+                              --bind /my/code:/code --bind /my/data:/data
+
+      --env KEY=VALUE       Set an environment variable inside the container
+                            for this run only, e.g. --env CUDA_VISIBLE_DEVICES=0
+
+      (Everything else Apptainer offers is optional — you likely won't need it.
+      For the full list, see official help: apptainer help exec)
+
+
+    ================================================================================
+      DIRECTORIES INSIDE THE CONTAINER
+    ================================================================================
+    These paths already exist inside the container, empty by default — bind your
+    own folders onto them so the container can read your files and write results:
+
+      /code            your training/eval scripts
+      /data            your input datasets
+      /output          checkpoints and logs get written here
+      /model           pretrained weights / HF cache (HF_HOME points here)
+      /scratch         node-local scratch space (temp files, not kept)
+
+      Also automatically available, no --bind needed:
+      $HOME            your normal home directory (NFS-backed on Param Shavak)
+      /tmp             temp space
+
+
+    ================================================================================
+      WHAT YOU CAN RUN
+    ================================================================================
+    Three ways to use this container: run it plainly, exec a specific task, or
+    shell in to work interactively.
+
+      RUN — start one of the container's built-in modes
+      -------------------------------------------------------
+      What it does: launches a pre-built mode (jupyter, tensorboard,
+      jupyter+tensorboard) that ships with the container. You don't point it
+      at a script — you just pick the mode you want, and it starts.
+
+      apptainer run --nv --bind /my/code:/code container.sif <mode>
+
+      jupyter               JupyterLab only (default)
+        apptainer run --nv --bind /my/code:/code container.sif jupyter
+
+      tensorboard           TensorBoard only, pointed at /output
+        apptainer run --nv --bind /my/output:/output container.sif tensorboard
+
+      jupyter+tensorboard   Both at once
+        apptainer run --nv --bind /my/code:/code --bind /my/output:/output \
+          container.sif jupyter+tensorboard
+
+      Running with no mode at all uses the default (jupyter). To be
+      explicit, always pass the mode you want.
+
+      EXEC — run your own commands and scripts
+      --------------------------------
+      What it does: runs a single command, or one of your own scripts (like
+      train.py), inside the container. This is how you actually do work — bind
+      in your code and data, set any env vars you need, and point exec at what
+      to run.
+
+      apptainer exec --nv --bind <your binds> container.sif <command> [ARGS...]
+
+      TRAIN — single GPU or CPU, running your own script
+        apptainer exec --nv \
+          --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+          container.sif python /code/train.py
+
+      DIST — multiple GPUs on one node (torchrun)
+        apptainer exec --nv \
+          --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+          container.sif \
+          torchrun --nproc_per_node=4 /code/train.py
+
+      JUPYTER — notebook server, reachable via SSH tunnel
+        apptainer exec --nv --bind /my/code:/code container.sif \
+          jupyter lab --ip=0.0.0.0 --no-browser --port=8888 --notebook-dir=/code
+        # then from your laptop:
+        ssh -L 8888:<compute-node>:8888 <you>@<login-node>
+        # open http://localhost:8888
+
+      ENV VAR example — selecting which GPU
+        apptainer exec --nv --env CUDA_VISIBLE_DEVICES=0 \
+          --bind /my/code:/code container.sif python /code/train.py
+
+      SHELL — drop into an interactive prompt
+      --------------------------------
+      What it does: starts an interactive shell inside the container.
+      No command or script is executed automatically. Useful for
+      inspecting the environment, checking installed packages, or
+      running commands manually.
+
+      apptainer shell --nv \
+        --bind /my/code:/code \
+      container.sif
+
+      You're now inside the container. Type `exit` to leave.
+
+
+    ================================================================================
+      RUNNING ON THE CLUSTER (SLURM)
+    ================================================================================
+    Single node, single/multi GPU:
+
+      #!/bin/bash
+      #SBATCH --job-name=torch-train
+      #SBATCH --gres=gpu:2
+      #SBATCH --cpus-per-task=16
+      #SBATCH --time=04:00:00
+
+      srun apptainer exec --nv \
+        --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+        --bind /my/model:/model \
+        container.sif \
+        torchrun --nproc_per_node=2 /code/train.py
+
+    MULTI-NODE (torchrun across nodes):
+
+      #!/bin/bash
+      #SBATCH --nodes=2
+      #SBATCH --gres=gpu:2
+      #SBATCH --ntasks-per-node=1
+      #SBATCH --cpus-per-task=16
+      #SBATCH --time=04:00:00
+
+      MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+      MASTER_PORT=29500
+
+      srun apptainer exec --nv \
+        --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+        container.sif \
+        torchrun --nnodes="$SLURM_NNODES" --nproc_per_node=2 \
+          --rdzv_backend=c10d --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
+          /code/train.py
+
+    NETWORK NOTES:
+      On InfiniBand nodes nothing extra is needed — NCCL detects IB
+      automatically. On Ethernet-only nodes, add:
+        --env NCCL_IB_DISABLE=1 --env NCCL_SOCKET_IFNAME=<iface, e.g. eth0>
+      If multi-node hangs at startup, set --env NCCL_DEBUG=INFO and check
+      which interface NCCL picked.
+      PCIe multi-GPU (no NVLink, as on Param Shavak's RTX 5000 Ada / A400
+      nodes) works out of the box — NCCL uses P2P over PCIe where topology
+      allows, falling back to shared-memory otherwise. Expect slower
+      all-reduce than NVLink; that's normal, not a container problem.
+
+
+    ================================================================================
+      INSTALLING EXTRA PACKAGES
+    ================================================================================
+    You can `pip install` something new right inside a running container — it
+    will work for that session. But the container filesystem resets on every
+    fresh run, so anything you installed is gone the next time you start it,
+    unless you do one of the following:
+
+      METHOD 1: Overlay (quick, one-off)
+      --------------------------------
+        apptainer overlay create --size 1024 overlay.img
+        apptainer shell --nv --overlay overlay.img --bind /my/code:/code container.sif
+        pip install <package>
+      Reuse the same overlay.img next time to see it again.
+
+      METHOD 2: venv in $HOME (cleaner, long-term)
+      --------------------------------
+        python3 -m venv --system-site-packages $HOME/envs/myenv
+        source $HOME/envs/myenv/bin/activate
+        unset PIP_CONSTRAINT
+        pip install <package>
+      Next time: just `source $HOME/envs/myenv/bin/activate`. Persists
+      automatically — $HOME is your real disk, not the container.
+      --system-site-packages keeps the base stack (torch, transformers,
+      datasets, accelerate, etc.) visible. unset PIP_CONSTRAINT releases the
+      base image's package lock.
+
+      METHOD 3: unset the lock, skip the venv
+      --------------------------------
+        unset PIP_CONSTRAINT
+        pip install <package>
+      Lands in ~/.local/lib/python3.12/site-packages, persists the same way.
+      The unset is per-shell — add it to your venv's activate script (or
+      $HOME/.bashrc, if you always want it off) so you're not retyping it.
+
+      HEADS UP
+      --------------------------------
+      - Not every container sets PIP_CONSTRAINT — depends on the base image.
+        Check: apptainer exec container.sif env | grep PIP_CONSTRAINT
+      - Overlay write targets also vary by base image (system site-packages
+        vs conda vs baked-in venv). Overlay install fails? Check the target:
+        apptainer exec --overlay overlay.img container.sif pip show -f <package> | grep Location
+
+    ================================================================================
+      CHECKING IT WORKS
+    ================================================================================
+      apptainer test --nv container.sif
+
+    Runs a quick built-in check. If it passes, you're good to go.
+    If it fails specifically on GPU access, run `nvidia-smi` on the host and
+    make sure the driver supports CUDA 13.2 or newer — then rebuild if not.
+    ================================================================================

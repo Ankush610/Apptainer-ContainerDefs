@@ -1,0 +1,326 @@
+Bootstrap: docker
+From: vllm/vllm-openai:v0.24.0
+# Base-image-first: official vLLM image already ships vLLM, torch, Ray, and
+# NCCL (multi-node ready). %post only adds mount points — no project extras
+# requested, so the base stack is untouched.
+
+%labels
+    Author        CDAC Pune
+    Maintainer    ankush
+    Version       1.0
+    Stack         vllm
+    BaseImage     vllm/vllm-openai:v0.24.0
+    CUDA          bundled (see base image)
+    Description   vLLM OpenAI-compatible inference server, single- and multi-node
+    BuildDate     2026-07-08
+
+%setup
+    # Nothing needed on the host before the container filesystem exists.
+
+%files
+    # No model or code baked in — model comes from /model (bind) or HF Hub,
+    # nothing else to copy.
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    # --- standard mount points (house convention, always identical) ---
+    # /code and /data see little use for a pure inference server, but keeping
+    # all five keeps behavior consistent across the container set.
+    mkdir -p /code /data /output /model /scratch
+    mkdir -p /model/hf-cache
+
+    # --- freeze the environment: protects base stack from user upgrades ---
+    pip freeze > /opt/base-constraints.txt
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    # Lock in-container pip installs to the shipped versions.
+    export PIP_CONSTRAINT=/opt/base-constraints.txt
+
+    # Model source — local path (default) or a HF repo id, e.g.
+    # MODEL=meta-llama/Llama-3.1-8B-Instruct. Either way weights/cache land
+    # on your bound disk, not lost when the container exits.
+    export MODEL="/model"
+    export HF_HOME="/model/hf-cache"
+
+    # Serving defaults — all overridable with --env at runtime.
+    export VLLM_PORT="8000"
+    export TP_SIZE="1"
+
+    # Fabric-neutral NCCL default. Per-fabric overrides (IB HCA pin,
+    # Ethernet NCCL_SOCKET_IFNAME/NCCL_IB_DISABLE) go in %help, not here —
+    # the fleet has both IB and Ethernet-only nodes, one image serves both.
+    export NCCL_DEBUG=WARN
+
+%test
+    #!/bin/sh
+    echo "== vLLM =="
+    python -c "import vllm; print('vllm', vllm.__version__)"
+    echo "== GPU check =="
+    python -c "import torch; print('CUDA available:', torch.cuda.is_available())" || \
+        echo "WARNING: no GPU visible — expected if testing on a CPU-only node."
+
+%runscript
+    # Single mode: serve. Multi-node is NOT a runscript mode — it's a
+    # multi-step Ray cluster launch, documented as raw commands in %help.
+    MODE="${1:-serve}"
+    [ "$#" -gt 0 ] && shift
+    case "$MODE" in
+        serve)
+            exec vllm serve "${MODEL}" \
+                 --tensor-parallel-size "${TP_SIZE}" \
+                 --host 0.0.0.0 --port "${VLLM_PORT}" "$@"
+            ;;
+        help|--help|-h)
+            exec apptainer help "$APPTAINER_CONTAINER" 2>/dev/null || \
+                 echo "Run: apptainer run-help <sif>"
+            ;;
+        *)
+            echo "Unknown mode: $MODE"
+            echo "Available modes: serve"
+            echo "For Ray/multi-node commands, see %help."
+            exit 1
+            ;;
+    esac
+
+%help
+    ================================================================================
+      WELCOME TO THE VLLM CONTAINER
+    ================================================================================
+    An OpenAI-compatible inference server for serving LLMs, single-node
+    (1+ GPUs, tensor-parallel) or multi-node (pipeline-parallel via Ray).
+    vLLM (base image v0.24.0) · CUDA/torch/Ray/NCCL all bundled in the base
+    image — nothing extra layered on top.
+    No model baked in — bind your own weights at /model, or point MODEL at
+    a Hugging Face repo id to auto-download.
+
+    New to Apptainer? Three commands you'll use:
+      apptainer run   <sif>   → just run it, easiest way to start
+      apptainer exec  <sif> X → run a specific command X inside it
+      apptainer shell <sif>   → drop into an interactive shell to look around
+
+
+    ================================================================================
+      QUICK START
+    ================================================================================
+      apptainer run --nv container.sif
+
+    (--nv gives it access to your GPU. Leave it out on a machine with no GPU
+    — though vLLM serving without a GPU has little practical use here.)
+
+
+    ================================================================================
+      FLAGS YOU'LL ACTUALLY USE
+    ================================================================================
+      --nv                   Required. Gives the container access to the
+                             host GPU(s). This container needs it for
+                             everything except `apptainer test`'s import check.
+
+      --bind src:dst         Make a folder on your machine visible inside the
+                             container at path dst. Bind /model with your
+                             weights, or leave it empty and let vLLM download
+                             from Hugging Face into it instead:
+                               --bind /my/models:/model
+
+      --env KEY=VALUE        Set an environment variable inside the container
+                             for this run only, e.g. to pick a model:
+                               --env MODEL=meta-llama/Llama-3.1-8B-Instruct
+                             or a HF token for gated models:
+                               --env HF_TOKEN=<token>
+
+      (For the full list, see official help: apptainer help exec)
+
+
+    ================================================================================
+      DIRECTORIES INSIDE THE CONTAINER
+    ================================================================================
+      /code            not used by this container (reserved, house convention)
+      /data            not used by this container (reserved, house convention)
+      /output          not used by this container (reserved, house convention)
+      /model           model weights (bind your own) + hf-cache/ for
+                       auto-downloaded HF Hub models
+      /scratch         node-local scratch space (temp files, not kept)
+
+      Also automatically available, no --bind needed:
+      $HOME            your normal home directory
+      /tmp             temp space
+
+
+    ================================================================================
+      WHAT YOU CAN RUN
+    ================================================================================
+      RUN — start the server
+      -------------------------------------------------------
+      What it does: launches the OpenAI-compatible API server, serving
+      whatever MODEL points at. Three scenarios, pick the one that matches:
+
+      SCENARIO 1: model already downloaded, sitting in your HF cache
+      (e.g. ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B exists)
+        apptainer run --nv \
+          --env MODEL=Qwen/Qwen3.5-4B \
+          --bind ~/.cache/huggingface:/model/hf-cache \
+          container.sif serve
+      Bind the WHOLE cache root, not the models--... subfolder — vLLM needs
+      to walk its internal blobs/refs/snapshots structure itself. Set MODEL
+      to the repo id (Org/Name), not a path.
+
+      SCENARIO 2: model files live in their own flat local directory
+      (config.json, weights, etc. directly inside it — not an HF cache)
+        apptainer run --nv \
+          --bind /my/models/Qwen3.5-4B:/model \
+          container.sif serve
+      Leave MODEL unset — it defaults to /model, which is what you bound.
+
+      SCENARIO 3: model not downloaded anywhere yet
+        apptainer run --nv \
+          --env MODEL=Qwen/Qwen3.5-4B \
+          --bind /my/models:/model/hf-cache \
+          container.sif serve
+      Same shape as Scenario 1, just an empty/fresh folder — vLLM downloads
+      into hf-cache/ on first run and reuses it on every run after. For
+      gated models add --env HF_TOKEN=<token>.
+
+      In all three, PORT can be set either way — pick whichever's convenient:
+        apptainer run --nv --env VLLM_PORT=2020 ... container.sif serve
+        apptainer run --nv ... container.sif serve --port 2020
+      vLLM's CLI takes the LAST occurrence of a repeated flag, so passing
+      --port after serve overrides the runscript's own --port "$VLLM_PORT"
+      rather than conflicting with it. Same applies to --tensor-parallel-size
+      and --host if you'd rather pass those directly than set TP_SIZE.
+
+      Extra vLLM flags (ones this container doesn't wrap) pass straight
+      through after `serve`:
+        apptainer run --nv --bind /my/models:/model container.sif serve \
+          --max-model-len 8192 --gpu-memory-utilization 0.9
+
+      Running with no mode at all uses the default (serve).
+
+      WHICH SETTINGS ARE --env, WHICH ARE serve FLAGS
+      --------------------------------
+      MODEL and HF_TOKEN/HF_HOME can only be set with --env — they're read
+      before the vllm command is built, not passed as CLI flags at all.
+      VLLM_PORT and TP_SIZE have --env defaults but can be overridden either
+      way, since a later `serve --port`/`--tensor-parallel-size` flag wins.
+      Everything else (--max-model-len, --gpu-memory-utilization, etc.) is a
+      raw vLLM CLI flag with no --env equivalent — always put it after
+      `serve`.
+
+      EXEC — run your own commands
+      --------------------------------
+      What it does: run a one-off command inside the container, e.g. to
+      check what's on the GPU or hit the API from inside the same container.
+
+      apptainer exec --nv container.sif nvidia-smi
+      apptainer exec --nv container.sif python -c "import torch; print(torch.cuda.device_count())"
+
+      SHELL — drop into an interactive prompt
+      --------------------------------
+      apptainer shell --nv --bind /my/models:/model container.sif
+
+      You're now inside the container. Type `exit` to leave.
+
+
+    ================================================================================
+      RUNNING ON THE CLUSTER (SLURM) — SINGLE NODE
+    ================================================================================
+      #SBATCH --gres=gpu:4
+      #SBATCH --cpus-per-task=16
+      #SBATCH --time=04:00:00
+
+      srun apptainer run --nv --bind /my/models:/model container.sif serve \
+           --tensor-parallel-size 4
+
+    Set TP_SIZE (or pass --tensor-parallel-size directly) to your GPU count
+    on the node. PCIe multi-GPU works fine — just slower than NVLink, that's
+    expected, not a container problem.
+
+
+    ================================================================================
+      RUNNING ON THE CLUSTER (SLURM) — MULTI-NODE
+    ================================================================================
+    Multi-node is a Ray cluster, not a single runscript call — it's a launch
+    sequence across nodes, then one process starts the server spanning them.
+
+      #SBATCH --nodes=2
+      #SBATCH --gres=gpu:4
+      #SBATCH --ntasks-per-node=1
+      #SBATCH --cpus-per-task=16
+
+      MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+
+      # 1. Head node starts the Ray head
+      srun --nodes=1 --ntasks=1 -w "$MASTER_ADDR" \
+        apptainer exec --nv container.sif ray start --head --port=6379 --block &
+
+      # 2. Every other node joins as a Ray worker
+      srun --nodes=$((SLURM_NNODES-1)) --ntasks=$((SLURM_NNODES-1)) \
+        --exclude="$MASTER_ADDR" \
+        apptainer exec --nv container.sif \
+        ray start --address="$MASTER_ADDR:6379" --block &
+
+      sleep 30   # give the Ray cluster time to form
+
+      # 3. One process launches the server, spanning the whole cluster
+      srun --nodes=1 --ntasks=1 -w "$MASTER_ADDR" \
+        apptainer exec --nv --bind /my/models:/model container.sif serve \
+        --pipeline-parallel-size "$SLURM_NNODES" \
+        --tensor-parallel-size 4
+
+    tensor-parallel-size = GPUs within a node (needs fast interconnect).
+    pipeline-parallel-size = number of nodes (tolerates slower links).
+    Total GPUs used = pipeline_size × tensor_size.
+
+    NETWORK NOTES
+    --------------------------------
+    InfiniBand nodes: nothing to set, NCCL auto-detects IB.
+    Ethernet-only nodes: add before srun —
+      export APPTAINERENV_NCCL_IB_DISABLE=1
+      export APPTAINERENV_NCCL_SOCKET_IFNAME=eth0
+    If multi-node hangs at startup, set --env NCCL_DEBUG=INFO and check
+    which interface NCCL picked.
+
+
+    ================================================================================
+      INSTALLING EXTRA PACKAGES
+    ================================================================================
+    METHOD 1: Overlay (quick, one-off)
+    --------------------------------
+      apptainer overlay create --size 1024 overlay.img
+      apptainer shell --nv --overlay overlay.img container.sif
+      pip install <package>
+    Reuse the same overlay.img next time to see it again.
+
+    METHOD 2: venv in $HOME (cleaner, long-term)
+    --------------------------------
+      python3 -m venv --system-site-packages $HOME/envs/myenv
+      source $HOME/envs/myenv/bin/activate
+      unset PIP_CONSTRAINT
+      pip install <package>
+    Next time: just `source $HOME/envs/myenv/bin/activate`. Persists
+    automatically — $HOME is your real disk, not the container.
+
+    METHOD 3: unset the lock, skip the venv
+    --------------------------------
+      unset PIP_CONSTRAINT
+      pip install <package>
+    Lands in ~/.local/lib/python3.11/site-packages, persists the same way.
+    The unset is per-shell — add it to $HOME/.bashrc if you always want it off.
+
+    HEADS UP
+    --------------------------------
+      Check current lock: apptainer exec container.sif env | grep PIP_CONSTRAINT
+
+
+    ================================================================================
+      CHECKING IT WORKS
+    ================================================================================
+      apptainer test --nv container.sif
+
+    Runs a quick import check (vllm module + version print) and a GPU
+    visibility check via torch.cuda.is_available(). Without --nv the GPU
+    check prints a warning rather than failing — expected on a CPU-only node.
+    ================================================================================
