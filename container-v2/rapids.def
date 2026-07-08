@@ -1,0 +1,374 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/rapidsai/notebooks:26.06-cuda12-py3.11
+# Base-image-first: official NGC RAPIDS notebooks image (ships JupyterLab,
+# example notebooks, conda-based RAPIDS env, and the IB/RDMA userspace stack
+# needed for multi-node dask-cuda). cuda12 tag chosen for broad driver
+# compatibility; switch to a cuda13 tag if the cluster driver supports it.
+
+%labels
+    Author        CDAC Pune
+    Maintainer    hpcsupport@cdac.in
+    Version       1.0
+    Stack         rapids
+    BaseImage     nvcr.io/nvidia/rapidsai/notebooks:26.06-cuda12-py3.11
+    CUDA          12
+    Description   RAPIDS (cuDF/cuML/dask-cuda) container for PARAM Shavak
+    BuildDate     2026-07-08
+
+%setup
+    # Runs on the HOST before the container filesystem exists. Not needed.
+
+%files
+    # No files copied in — no project code baked into the image.
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    # --- standard mount points (house convention, always identical) ---
+    mkdir -p /code /data /output /model /scratch
+
+    # --- lock the base image's package set before any extras ---
+    conda env export > /opt/base-env.yml
+    pip freeze > /opt/base-constraints.txt
+
+    # --- cleanup ---
+    pip cache purge || true
+    conda clean -afy || true
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    # Lock in-container pip installs to the shipped versions.
+    # Users building their own venv are told in %help to unset this.
+    export PIP_CONSTRAINT=/opt/base-constraints.txt
+
+    # Apptainer auto-binds the host $HOME into the container. If a user has
+    # ever run `pip install --user` on the host, the resulting package in
+    # ~/.local/lib/pythonX.Y/site-packages takes priority over the conda
+    # env's site-packages on sys.path — silently shadowing (and breaking
+    # ABI compatibility with) the correctly paired conda packages (this is
+    # exactly what broke cudf/pyarrow decimal32 support). Force Python to
+    # ignore the user site-packages dir so the container's conda env is
+    # always what actually gets imported, regardless of host-side pip state.
+    export PYTHONNOUSERSITE=1
+
+    # Safe, fabric-neutral defaults ONLY (see networking.md).
+    # Do NOT set NCCL_IB_DISABLE / NCCL_SOCKET_IFNAME / UCX_NET_DEVICES here
+    # — those are per-cluster overrides documented in %help.
+    export NCCL_DEBUG=WARN
+    export DASK_DISTRIBUTED__COMM__UCX__CREATE_CUDA_CONTEXT=True
+
+%test
+    #!/bin/sh
+    echo "== Python / RAPIDS stack =="
+    python -c "import cudf, cuml; print('cudf', cudf.__version__); print('cuml', cuml.__version__)" || \
+        echo "WARNING: cudf/cuml import failed. Expected on a CPU-only build host."
+    echo "== GPU visibility =="
+    if python -c "import cupy; import sys; sys.exit(0 if cupy.cuda.runtime.getDeviceCount() > 0 else 1)" 2>/dev/null; then
+        python -c "import cupy; print('CUDA OK: device count', cupy.cuda.runtime.getDeviceCount())"
+    else
+        echo "WARNING: no GPU visible. Fine on a CPU host / missing --nv."
+        echo "         On a GPU node, run: apptainer test --nv <sif>"
+    fi
+
+%runscript
+    # Named built-in modes. Keep in sync with %help "WHAT YOU CAN RUN".
+    MODE="${1:-jupyter}"
+    [ "$#" -gt 0 ] && shift
+    case "$MODE" in
+        jupyter)
+            exec jupyter lab --ip=0.0.0.0 --no-browser --port="${JUPYTER_PORT:-8888}" \
+                 --notebook-dir=/code --allow-root "$@"
+            ;;
+        dask-scheduler)
+            exec dask scheduler --host 0.0.0.0 --port "${DASK_SCHED_PORT:-8786}" \
+                 --dashboard-address "0.0.0.0:${DASK_DASHBOARD_PORT:-8787}" "$@"
+            ;;
+        dask-worker)
+            exec dask-cuda-worker "${DASK_SCHEDULER_ADDRESS:?set DASK_SCHEDULER_ADDRESS=tcp://<sched-host>:8786}" \
+                 --protocol "${DASK_PROTOCOL:-tcp}" "$@"
+            ;;
+        help|--help|-h)
+            exec apptainer help "$APPTAINER_CONTAINER" 2>/dev/null || \
+                 echo "Run: apptainer run-help <sif>"
+            ;;
+        *)
+            echo "Unknown mode: $MODE"
+            echo "Available modes: jupyter | dask-scheduler | dask-worker"
+            echo "For your own scripts use: apptainer exec ... <sif> python /code/yourscript.py"
+            exit 1
+            ;;
+    esac
+
+%startscript
+    # For `apptainer instance start`. Mirrors the long-running runscript modes.
+    MODE="${1:-jupyter}"
+    [ "$#" -gt 0 ] && shift
+    case "$MODE" in
+        jupyter)
+            exec jupyter lab --ip=0.0.0.0 --no-browser --port="${JUPYTER_PORT:-8888}" \
+                 --notebook-dir=/code --allow-root "$@"
+            ;;
+        dask-scheduler)
+            exec dask scheduler --host 0.0.0.0 --port "${DASK_SCHED_PORT:-8786}" \
+                 --dashboard-address "0.0.0.0:${DASK_DASHBOARD_PORT:-8787}" "$@"
+            ;;
+        dask-worker)
+            exec dask-cuda-worker "${DASK_SCHEDULER_ADDRESS:?set DASK_SCHEDULER_ADDRESS}" \
+                 --protocol "${DASK_PROTOCOL:-tcp}" "$@"
+            ;;
+        *)
+            echo "Unknown instance mode: $MODE" >&2
+            exit 1
+            ;;
+    esac
+
+%help
+    ================================================================================
+      WELCOME TO THE RAPIDS CONTAINER
+    ================================================================================
+    A GPU container for RAPIDS data science: cuDF, cuML, cuGraph, and
+    distributed GPU compute via dask-cuda.
+    RAPIDS 26.06 · CUDA 12 · Python 3.11. GPU required for the RAPIDS libs;
+    JupyterLab and shell work without one.
+    No project code baked in — mount your own code at /code.
+
+    New to Apptainer? Three commands you'll use:
+      apptainer run   <sif>   -> just run it, easiest way to start
+      apptainer exec  <sif> X -> run a specific command X inside it
+      apptainer shell <sif>   -> drop into an interactive shell to look around
+
+
+    ================================================================================
+      QUICK START
+    ================================================================================
+      apptainer run --nv container.sif
+
+    (--nv gives it access to your GPU. Leave it out on a machine with no GPU.)
+
+
+    ================================================================================
+      FLAGS YOU'LL ACTUALLY USE
+    ================================================================================
+      --nv                  Give the container access to your GPU(s).
+                            Use it any time you're doing GPU work (NVIDIA).
+
+      --rocm                Same idea as --nv, but for AMD GPUs.
+                            Use it instead of --nv on ROCm-based systems.
+
+      --bind src:dst        Make a folder on your machine visible inside the
+                            container at path dst. This is how the container
+                            sees your code, data, and writes results back out.
+                            Repeat the flag to bind more than one folder:
+                              --bind /my/code:/code --bind /my/data:/data
+
+      --env KEY=VALUE       Set an environment variable inside the container
+                            for this run only, e.g. --env CUDA_VISIBLE_DEVICES=0
+
+      (Everything else Apptainer offers is optional — you likely won't need it.
+      For the full list, see official help: apptainer help exec)
+
+
+    ================================================================================
+      DIRECTORIES INSIDE THE CONTAINER
+    ================================================================================
+    These paths already exist inside the container, empty by default — bind your
+    own folders onto them so the container can read your files and write results:
+
+      /code            your training/eval scripts and notebooks
+      /data            your input datasets
+      /output          results and logs get written here
+      /model           pretrained weights, if you have any
+      /scratch         node-local scratch space (temp files, not kept)
+
+      Also automatically available, no --bind needed:
+      $HOME            your normal home directory
+      /tmp             temp space
+
+
+    ================================================================================
+      WHAT YOU CAN RUN
+    ================================================================================
+    Three ways to use this container: run it plainly, exec a specific task, or
+    shell in to work interactively.
+
+      RUN — start one of the container's built-in modes
+      -------------------------------------------------------
+      What it does: launches a pre-built mode (jupyter, dask-scheduler,
+      dask-worker) that ships with the container. You don't point it at a
+      script — you just pick the mode you want, and it starts.
+
+      apptainer run --nv --bind /my/code:/code container.sif <mode>
+
+      jupyter                JupyterLab + dask-labextension dashboard
+        apptainer run --nv --bind /my/code:/code --bind /my/data:/data \
+          container.sif jupyter
+
+      dask-scheduler          Dask scheduler (bind to your node's IP for
+                              others to find it)
+        apptainer run --nv container.sif dask-scheduler
+
+      dask-worker              GPU dask-cuda worker; point it at a scheduler
+        apptainer run --nv \
+          --env DASK_SCHEDULER_ADDRESS=tcp://<scheduler-host>:8786 \
+          --env DASK_PROTOCOL=tcp \
+          container.sif dask-worker
+
+      Running with no mode at all uses the default (jupyter). To be
+      explicit, always pass the mode you want.
+
+      EXEC — run your own commands and scripts
+      --------------------------------
+      What it does: runs a single command, or one of your own scripts, inside
+      the container. This is how you actually do work — bind in your code and
+      data, set any env vars you need, and point exec at what to run.
+
+      apptainer exec --nv --bind <your binds> container.sif <command> [ARGS...]
+
+      TRAIN — single GPU, running your own script
+        apptainer exec --nv --bind /my/code:/code --bind /my/data:/data \
+          --bind /my/output:/output container.sif python /code/train.py
+
+      JUPYTER — notebook server, reachable via SSH tunnel
+        apptainer exec --nv --bind /my/code:/code container.sif \
+          jupyter lab --ip=0.0.0.0 --no-browser --port=8888
+        # then from your laptop:
+        ssh -L 8888:<compute-node>:8888 <you>@<login-node>
+        # open http://localhost:8888
+
+      ENV VAR example — pick which GPU
+        apptainer exec --nv --env CUDA_VISIBLE_DEVICES=0 \
+          --bind /my/code:/code container.sif python /code/script.py
+
+      SHELL — drop into an interactive prompt
+      --------------------------------
+      What it does: starts an interactive shell inside the container.
+      No command or script is executed automatically. Useful for
+      inspecting the environment, checking installed packages, or
+      running commands manually.
+
+      apptainer shell --nv \
+        --bind /my/code:/code \
+      container.sif
+
+      You're now inside the container. Type `exit` to leave.
+
+
+    ================================================================================
+      RUNNING ON THE CLUSTER (SLURM)
+    ================================================================================
+      SINGLE NODE, single or multiple GPUs — an sbatch snippet:
+
+        #!/bin/bash
+        #SBATCH --job-name=rapids-job
+        #SBATCH --gres=gpu:2
+        #SBATCH --cpus-per-task=16
+
+        srun apptainer exec --nv \
+          --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+          container.sif python /code/script.py
+
+      MULTI-NODE — dask-cuda cluster across nodes: scheduler on node 0,
+      dask-cuda-worker on every node. Two-part sbatch example:
+
+        #!/bin/bash
+        #SBATCH --job-name=rapids-dask
+        #SBATCH --nodes=4
+        #SBATCH --gres=gpu:4
+        #SBATCH --ntasks-per-node=1
+        #SBATCH --cpus-per-task=32
+
+        NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+        SCHED_NODE=$(echo "$NODES" | head -n1)
+        SCHED_ADDR="tcp://${SCHED_NODE}:8786"
+
+        # start the scheduler on node 0 only
+        srun --nodes=1 --ntasks=1 -w "$SCHED_NODE" \
+          apptainer exec --nv container.sif dask scheduler \
+          --host 0.0.0.0 --port 8786 &
+
+        sleep 10   # give the scheduler a moment to come up
+
+        # start a dask-cuda-worker on every node (scheduler node included)
+        srun apptainer exec --nv \
+          --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+          --env DASK_SCHEDULER_ADDRESS="$SCHED_ADDR" \
+          --env DASK_PROTOCOL=ucx \
+          container.sif dask-worker
+
+        wait
+
+      Use `--env DASK_PROTOCOL=ucx` on InfiniBand partitions for RDMA
+      transport; use `--env DASK_PROTOCOL=tcp` (the default) on Ethernet-only
+      partitions.
+
+      NETWORK NOTES
+        On InfiniBand nodes nothing extra is needed for NCCL — it detects IB
+        automatically. For dask-cuda specifically, set --env DASK_PROTOCOL=ucx
+        and optionally --env UCX_NET_DEVICES=mlx5_0:1 to pin a specific HCA.
+        On Ethernet-only nodes, add:
+          --env NCCL_IB_DISABLE=1 --env NCCL_SOCKET_IFNAME=<iface, e.g. eth0>
+        If multi-node hangs at startup, set --env NCCL_DEBUG=INFO and check
+        which interface NCCL picked.
+
+
+    ================================================================================
+      INSTALLING EXTRA PACKAGES
+    ================================================================================
+    You can `pip install` something new right inside a running container — it
+    will work for that session. But the container filesystem resets on every
+    fresh run, so anything you installed is gone the next time you start it,
+    unless you do one of the following:
+
+      METHOD 1: Overlay (quick, one-off)
+      --------------------------------
+        apptainer overlay create --size 1024 overlay.img
+        apptainer shell --nv --overlay overlay.img --bind /my/code:/code container.sif
+        pip install <package>
+      Reuse the same overlay.img next time to see it again.
+
+      METHOD 2: venv in $HOME (cleaner, long-term)
+      --------------------------------
+        python3 -m venv --system-site-packages $HOME/envs/myenv
+        source $HOME/envs/myenv/bin/activate
+        unset PIP_CONSTRAINT
+        pip install <package>
+      Next time: just `source $HOME/envs/myenv/bin/activate`. Persists
+      automatically — $HOME is your real disk, not the container.
+      --system-site-packages keeps the base stack (cudf, cuml, cugraph, dask,
+      etc.) visible. unset PIP_CONSTRAINT releases the base image's package lock.
+
+      METHOD 3: unset the lock, skip the venv
+      --------------------------------
+        unset PIP_CONSTRAINT
+        pip install <package>
+      Lands in ~/.local/lib/python3.11/site-packages, persists the same way.
+      The unset is per-shell — add it to your venv's activate script (or
+      $HOME/.bashrc, if you always want it off) so you're not retyping it.
+      NOTE: this container sets PYTHONNOUSERSITE=1, so packages installed
+      this way will NOT be importable until you also unset PYTHONNOUSERSITE
+      (or use METHOD 2's --system-site-packages venv instead, which is why
+      it's the recommended path for persistence).
+
+      HEADS UP
+      --------------------------------
+      - This container's base env is conda-managed (RAPIDS libs live there).
+        `conda install` into the running container will fail without an
+        overlay — use one of the pip methods above for extras instead.
+      - Not every container sets PIP_CONSTRAINT — depends on the base image.
+        Check: apptainer exec container.sif env | grep PIP_CONSTRAINT
+      - Overlay write targets also vary by base image (system site-packages
+        vs conda vs baked-in venv). Overlay install fails? Check the target:
+        apptainer exec --overlay overlay.img container.sif pip show -f <package> | grep Location
+
+
+    ================================================================================
+      CHECKING IT WORKS
+    ================================================================================
+      apptainer test --nv container.sif
+
+    Runs a quick built-in check. If it passes, you're good to go.
+    If it fails specifically on GPU access, run `nvidia-smi` on the host and
+    make sure the driver supports CUDA 12 or newer — then rebuild if not.
