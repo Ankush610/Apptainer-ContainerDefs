@@ -1,0 +1,177 @@
+========================================================================================
+<<<<<Name>>>>> PyTorch <<<<</Name>>>>>
+========================================================================================
+<<<<<Small Description>>>>> Lightweight PyTorch Deep Learning Environment with Essential DL Stack <<<<</Small Description>>>>>
+========================================================================================
+<<<<<Description>>>>> This is a lightweight container optimized for PyTorch deep learning model development and research. The environment includes only essential libraries to minimize container size while providing a complete deep learning stack. It features PyTorch with CUDA support, essential data science libraries, and Jupyter Lab for interactive development. The container is designed for efficient GPU-accelerated deep learning workflows with minimal overhead.
+
+Key Features:
+- Python with PyTorch ecosystem (torch, torchvision, torchaudio)
+- CUDA support for GPU acceleration
+- PyTorch Lightning for structured training
+- Essential data science stack (NumPy, Pandas, Scikit-learn)
+- Visualization tools (Matplotlib, Seaborn)
+- Development environment (Jupyter Lab, IPython)
+- Optimized cache settings for temporary directories
+- Extensible design for adding domain-specific packages <<<<</Description>>>>>
+========================================================================================
+<<<<<Image Version>>>>> 1.0 <<<<</Image Version>>>>>
+========================================================================================
+<<<<<Publisher>>>>> CDAC <<<<</Publisher>>>>>
+========================================================================================
+<<<<<Modified>>>>> July 18, 2025 <<<<</Modified>>>>>
+========================================================================================
+<<<<<Compressed Size>>>>> 5.9G (estimated) <<<<</Compressed Size>>>>>
+========================================================================================
+<<<<<Multinode Support>>>>> No <<<<</Multinode Support>>>>>
+========================================================================================
+<<<<<Multi-Arch Support>>>>> Yes (Linux x86_64) <<<<</Multi-Arch Support>>>>>
+========================================================================================
+
+
+<<<<<System requirements>>>>> Before running this container, ensure your system meets the following requirements.
+
+        Apptainer / Singularity runtime
+        Linux x86_64 architecture
+
+        NVIDIA GPU with CUDA support (optional, CPU fallback available)
+        NVIDIA Container Toolkit for GPU access
+        CUDA-compatible GPU driver (if using GPU acceleration)
+
+        Minimum 4GB RAM (8GB+ recommended for deep learning)
+        Minimum 10GB free disk space for container and cache
+
+<<<<</System requirements>>>>>
+========================================================================================
+<<<<<Included Packages>>>>> The container ships with a deep learning and data science stack pre-installed, so most workflows work out of the box with no extra setup. This is a representative list of the core packages present across builds of this container family, not the full install — run a shell inside the container and use `pip list` to see everything actually installed in a given build.
+
+	Core Framework
+	--------------------------------
+	torch, torchvision, transformers, accelerate
+	tokenizers, datasets, safetensors, huggingface_hub
+
+	Data Science & Visualization
+	--------------------------------
+	numpy, pandas, scipy, matplotlib
+
+	Development & Notebooks
+	--------------------------------
+	jupyterlab, notebook, ipython
+
+	Experiment Tracking
+	--------------------------------
+	tensorboard, wandb
+
+<<<<</Included Packages>>>>>
+========================================================================================
+<<<<<Directory Structure>>>>> These paths exist inside the container, empty by default — bind your own folders onto them so the container can read your files and write results back out:
+
+        /code            your training/eval scripts
+        /data            your input datasets
+        /output          checkpoints and logs get written here
+        /model           pretrained weights / cache directory
+        /scratch         node-local scratch space (temp files, not kept)
+
+        Also automatically available, no --bind needed:
+        $HOME            your normal home directory
+        /tmp             temp space
+
+<<<<</Directory Structure>>>>>
+========================================================================================
+<<<<<Basic Flags>>>>> A handful of flags cover almost everything you'll need day to day:
+
+        --nv                  Give the container access to your NVIDIA GPU(s).
+                              Use it any time you're doing GPU work. Omit it
+                              for CPU-only execution.
+
+        --bind src:dst        Make a folder on your machine visible inside the
+                              container at path dst. This is how the container
+                              sees your code, data, and writes results back out.
+                              Repeat the flag to bind more than one folder:
+                                --bind /my/code:/code --bind /my/data:/data
+
+        --env KEY=VALUE       Set an environment variable inside the container
+                              for this run only, e.g. --env CUDA_VISIBLE_DEVICES=0
+
+        (For the full list of options, see: apptainer help exec)
+
+<<<<</Basic Flags>>>>>
+========================================================================================
+<<<<<Modes>>>>> There are four ways to use this container: run it plainly, exec a specific command, shell in interactively, or launch it as a background instance.
+
+        RUN — start a built-in mode
+        --------------------------------
+        Launches a pre-built mode that ships with the container (e.g. jupyter).
+        You don't point it at a script — you just pick the mode and it starts.
+        The mode name goes at the end of the command.
+
+          apptainer run --nv --bind /my/code:/code container.sif <mode>
+
+        EXEC — run your own commands and scripts
+        --------------------------------
+        Runs a single command, or one of your own scripts (like train.py),
+        inside the container. This is how you do actual work — bind in your
+        code and data, set any env vars you need, and point exec at what to run.
+
+          apptainer exec --nv --bind /my/code:/code --bind /my/data:/data \
+            container.sif python /code/train.py
+
+          # Multiple GPUs on one node
+          apptainer exec --nv --bind /my/code:/code container.sif \
+            torchrun --nproc_per_node=2 /code/train.py
+
+          # Jupyter Lab, reachable via SSH tunnel
+          apptainer exec --nv --bind /my/code:/code container.sif \
+            jupyter lab --ip=0.0.0.0 --no-browser --port=8888 --notebook-dir=/code
+          # then from your laptop:
+          ssh -L 8888:<compute-node>:8888 <you>@<login-node>
+          # open http://localhost:8888
+
+        SHELL — drop into an interactive prompt
+        --------------------------------
+        Starts an interactive shell inside the container. No command runs
+        automatically — useful for inspecting the environment, checking
+        installed packages, or running things manually.
+
+          apptainer shell --nv --bind /my/code:/code container.sif
+          # Type `exit` to leave.
+
+        INSTANCE — run the container as a persistent background service
+        --------------------------------
+        Starts the container detached, so it keeps running (e.g. a long
+        training job or a Jupyter/TensorBoard server) after you disconnect.
+
+          apptainer instance start --nv --bind /my/code:/code \
+            container.sif torch-job
+
+          apptainer exec instance://torch-job python /code/train.py
+
+          apptainer instance list
+          apptainer instance stop torch-job
+
+<<<<</Modes>>>>>
+========================================================================================
+<<<<<Installing Extra Packages>>>>> You can `pip install` something new right inside a running container — it will work for that session. But the container filesystem resets on every fresh run, so anything you installed is gone next time, unless you use an overlay:
+
+        apptainer overlay create --size 1024 overlay.img
+        apptainer shell --nv --overlay overlay.img --bind /my/code:/code container.sif
+        pip install <package>
+
+        Reuse the same overlay.img next time to see the package again.
+
+<<<<</Installing Extra Packages>>>>>
+========================================================================================
+<<<<<More Help & Testing>>>>> For the full list of built-in modes, flags, and usage details:
+
+        apptainer run-help container.sif
+
+To check that the container is intact and working:
+
+        apptainer test container.sif
+
+To also confirm the GPU is being picked up correctly, add --nv:
+
+        apptainer test --nv container.sif
+
+<<<<</More Help & Testing>>>>>
+========================================================================================

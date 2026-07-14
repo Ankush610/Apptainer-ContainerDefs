@@ -1,0 +1,159 @@
+========================================================================================
+<<<<<version id>>>>> 1.0 <<<<</version id>>>>>
+========================================================================================
+<<<<<datetime>>>>> 2026-07-08 <<<<</datetime>>>>>
+========================================================================================
+<<<<<size>>>>> <TBD> <<<<</size>>>>>
+========================================================================================
+========================================================================================
+<<<<<How to Run>>>>>
+
+  ================================================================================
+    QUICK START
+  ================================================================================
+    apptainer run --nv --bind /my/models:/model container.sif serve
+
+  (--nv is required — this is a GPU inference server. No project code or model
+  is baked in; bind your weights or point at a Hugging Face repo id.)
+
+
+  ================================================================================
+    MODES & FLAGS
+  ================================================================================
+    MODES (this container ships one built-in mode)
+    --------------------------------------------------------------------------
+      serve (default)   OpenAI-compatible API server
+
+      # Model already in your local HF cache
+      apptainer run --nv \
+        --env MODEL=Qwen/Qwen3.5-4B \
+        --bind ~/.cache/huggingface:/model/hf-cache \
+        container.sif serve
+
+      # Model files in their own flat local directory
+      apptainer run --nv --bind /my/models/Qwen3.5-4B:/model container.sif serve
+
+      # Model not downloaded yet — vLLM downloads on first run
+      apptainer run --nv \
+        --env MODEL=Qwen/Qwen3.5-4B --env HF_TOKEN=<token> \
+        --bind /my/models:/model/hf-cache container.sif serve
+
+    FLAGS
+    --------------------------------------------------------------------------
+      --nv                required
+      --bind src:dst      --bind /my/models:/model
+      --env KEY=VALUE     --env MODEL=meta-llama/Llama-3.1-8B-Instruct
+                          --env HF_TOKEN=<token>
+                          --env VLLM_PORT=2020
+
+      Extra vLLM flags pass straight through after `serve`:
+        apptainer run --nv --bind /my/models:/model container.sif serve \
+          --max-model-len 8192 --gpu-memory-utilization 0.9
+
+    Directories to bind: /model (weights + hf-cache/) /scratch
+
+
+  ================================================================================
+    RUN YOUR OWN SCRIPT (EXEC)
+  ================================================================================
+    This container serves, it doesn't train — "your own script" here means a
+    client hitting the running server's OpenAI-compatible endpoint:
+
+      apptainer exec --nv container.sif python3 - <<'PY'
+      from openai import OpenAI
+      client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+      resp = client.chat.completions.create(
+          model="Qwen/Qwen3.5-4B",
+          messages=[{"role": "user", "content": "Hello!"}],
+      )
+      print(resp.choices[0].message.content)
+      PY
+
+    # One-off GPU check
+    apptainer exec --nv container.sif nvidia-smi
+
+
+  ================================================================================
+    SLURM — SINGLE NODE
+  ================================================================================
+    #!/bin/bash
+    #SBATCH --job-name=vllm-serve
+    #SBATCH --gres=gpu:4
+    #SBATCH --cpus-per-task=16
+    #SBATCH --partition=gpu
+    #SBATCH --output=./logs/logs_%j.out
+    #SBATCH --error=./logs/logs_%j.err
+    #SBATCH --time=04:00:00
+
+    echo "===================================="
+    echo "Job Name   : $SLURM_JOB_NAME"
+    echo "GPUs       : $SLURM_GPUS_ON_NODE"
+    echo "===================================="
+
+    srun apptainer run --nv --bind /my/models:/model container.sif serve \
+      --tensor-parallel-size 4
+
+    echo "===================================="
+    echo "Server Exited"
+    echo "===================================="
+
+    Set TP_SIZE (or --tensor-parallel-size) to the node's GPU count.
+
+
+  ================================================================================
+    SLURM — MULTI-NODE  (Ray cluster: head + workers, then one pipeline-
+                         parallel serve call — house-style logs/echo banners)
+  ================================================================================
+    #!/bin/bash
+    #SBATCH --job-name=vllm-serve-multinode
+    #SBATCH --nodes=2
+    #SBATCH --gres=gpu:4
+    #SBATCH --ntasks-per-node=1
+    #SBATCH --cpus-per-task=16
+    #SBATCH --output=./logs/logs_%j.out
+    #SBATCH --error=./logs/logs_%j.err
+    #SBATCH --time=04:00:00
+
+    MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+
+    echo "===================================="
+    echo "Job Name   : $SLURM_JOB_NAME"
+    echo "Master Addr: $MASTER_ADDR"
+    echo "Nodes      : $SLURM_NNODES"
+    echo "===================================="
+
+    # 1. Head node starts the Ray head
+    srun --nodes=1 --ntasks=1 -w "$MASTER_ADDR" \
+      apptainer exec --nv container.sif ray start --head --port=6379 --block &
+
+    # 2. Every other node joins as a Ray worker
+    srun --nodes=$((SLURM_NNODES-1)) --ntasks=$((SLURM_NNODES-1)) \
+      --exclude="$MASTER_ADDR" \
+      apptainer exec --nv container.sif \
+      ray start --address="$MASTER_ADDR:6379" --block &
+
+    sleep 30   # give the Ray cluster time to form
+
+    # 3. One process launches the server, spanning the whole cluster
+    srun --nodes=1 --ntasks=1 -w "$MASTER_ADDR" \
+      apptainer exec --nv --bind /my/models:/model container.sif serve \
+      --pipeline-parallel-size "$SLURM_NNODES" \
+      --tensor-parallel-size 4
+
+    echo "===================================="
+    echo "Server Exited"
+    echo "===================================="
+
+    tensor-parallel-size = GPUs within a node. pipeline-parallel-size = number
+    of nodes. Total GPUs used = pipeline_size x tensor_size.
+    Ethernet-only nodes: export APPTAINERENV_NCCL_IB_DISABLE=1 and
+    APPTAINERENV_NCCL_SOCKET_IFNAME=eth0 before the srun calls above.
+
+
+  ================================================================================
+    CHECKING IT WORKS
+  ================================================================================
+    apptainer test --nv container.sif
+
+<<<<</How to Run>>>>>
+========================================================================================

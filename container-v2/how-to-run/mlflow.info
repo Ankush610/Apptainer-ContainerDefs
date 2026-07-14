@@ -1,0 +1,94 @@
+========================================================================================
+<<<<<version id>>>>> 1.0 <<<<</version id>>>>>
+========================================================================================
+<<<<<datetime>>>>> 2026-07-07 <<<<</datetime>>>>>
+========================================================================================
+<<<<<size>>>>> <TBD> <<<<</size>>>>>
+========================================================================================
+========================================================================================
+<<<<<How to Run>>>>>
+
+  ================================================================================
+    QUICK START
+  ================================================================================
+    apptainer run --bind /my/code:/code --bind /my/output:/output container.sif jupyter
+
+  (CPU-only — no --nv / --rocm needed. `import mlflow` works out of the box.)
+
+
+  ================================================================================
+    MODES & FLAGS
+  ================================================================================
+    MODES
+    --------------------------------------------------------------------------
+      jupyter (default)   JupyterLab, import mlflow works out of the box
+        apptainer run --bind /my/code:/code --bind /my/output:/output \
+          container.sif jupyter
+
+      mlflow               MLflow tracking server + UI only
+        apptainer run --bind /my/output:/output container.sif mlflow
+
+      jupyter+mlflow        Both at once (server in background, Jupyter in foreground)
+        apptainer run --bind /my/code:/code --bind /my/output:/output \
+          container.sif jupyter+mlflow
+
+    FLAGS
+    --------------------------------------------------------------------------
+      --bind src:dst     --bind /my/code:/code --bind /my/output:/output
+      --env KEY=VALUE    --env MLFLOW_PORT=5001
+
+    Directories to bind: /code /data /output (mlflow.db + artifacts/ land here) /model /scratch
+
+
+  ================================================================================
+    RUN YOUR OWN SCRIPT (EXEC)
+  ================================================================================
+    # Train — logs to MLflow via /output automatically
+    apptainer exec \
+      --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+      container.sif python /code/train.py
+
+    # Inspect runs without starting the full server
+    apptainer exec --bind /my/output:/output container.sif mlflow runs list
+
+
+  ================================================================================
+    SLURM — SINGLE NODE
+  ================================================================================
+    #!/bin/bash
+    #SBATCH --job-name=classical-ml-mlflow-train
+    #SBATCH --cpus-per-task=8
+    #SBATCH --mem=32G
+    #SBATCH --partition=cpu
+    #SBATCH --output=./logs/logs_%j.out
+    #SBATCH --error=./logs/logs_%j.err
+    #SBATCH --time=02:00:00
+
+    echo "===================================="
+    echo "Job Name   : $SLURM_JOB_NAME"
+    echo "CPUs       : $SLURM_CPUS_PER_TASK"
+    echo "===================================="
+
+    srun apptainer exec \
+      --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+      container.sif python /code/train.py
+
+    echo "===================================="
+    echo "Training Completed"
+    echo "===================================="
+
+    No multi-node section — single-process, single-node by design. Each job's
+    /output bind gets its own mlflow.db. For one tracking server shared across
+    several jobs instead:
+      srun apptainer run --bind /my/output:/output container.sif mlflow &
+      export MLFLOW_TRACKING_URI=http://<server-node>:5000
+    Find <server-node> with: squeue -j <jobid> -o "%N"
+
+
+  ================================================================================
+    CHECKING IT WORKS
+  ================================================================================
+    apptainer test container.sif
+
+<<<<</How to Run>>>>>
+========================================================================================

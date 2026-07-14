@@ -1,0 +1,83 @@
+========================================================================================
+<<<<<version id>>>>> 1.0 <<<<</version id>>>>>
+========================================================================================
+<<<<<datetime>>>>> 2026-07-07 <<<<</datetime>>>>>
+========================================================================================
+<<<<<size>>>>> <TBD> <<<<</size>>>>>
+========================================================================================
+========================================================================================
+<<<<<How to Run>>>>>
+
+  ================================================================================
+    QUICK START
+  ================================================================================
+    apptainer run --bind /my/code:/code container.sif jupyter
+
+  (CPU-only — no --nv / --rocm needed.)
+
+
+  ================================================================================
+    MODES & FLAGS
+  ================================================================================
+    MODES (this container ships one built-in mode)
+    --------------------------------------------------------------------------
+      jupyter (default)   JupyterLab
+        apptainer run --bind /my/code:/code --bind /my/data:/data \
+          container.sif jupyter
+
+    FLAGS
+    --------------------------------------------------------------------------
+      --bind src:dst     apptainer exec --bind /my/code:/code --bind /my/data:/data \
+                          --bind /my/output:/output container.sif <cmd>
+
+      --env KEY=VALUE    apptainer exec --env OMP_NUM_THREADS=4 \
+                          --bind /my/code:/code container.sif python /code/train.py
+
+    Directories to bind: /code /data /output /model /scratch
+
+
+  ================================================================================
+    RUN YOUR OWN SCRIPT (EXEC)
+  ================================================================================
+    apptainer exec \
+      --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+      container.sif python /code/train.py
+
+
+  ================================================================================
+    SLURM — SINGLE NODE
+  ================================================================================
+    #!/bin/bash
+    #SBATCH --job-name=classical-ml-train
+    #SBATCH --cpus-per-task=8
+    #SBATCH --mem=32G
+    #SBATCH --partition=cpu
+    #SBATCH --output=./logs/logs_%j.out
+    #SBATCH --error=./logs/logs_%j.err
+    #SBATCH --time=02:00:00
+
+    echo "===================================="
+    echo "Job Name   : $SLURM_JOB_NAME"
+    echo "CPUs       : $SLURM_CPUS_PER_TASK"
+    echo "===================================="
+
+    srun apptainer exec \
+      --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+      container.sif python /code/train.py
+
+    echo "===================================="
+    echo "Training Completed"
+    echo "===================================="
+
+    No multi-node section — this stack (xgboost/lightgbm/sklearn on tabular
+    data) is single-process, single-node by design. Size --cpus-per-task to
+    your core count and let the library parallelize internally.
+
+
+  ================================================================================
+    CHECKING IT WORKS
+  ================================================================================
+    apptainer test container.sif
+
+<<<<</How to Run>>>>>
+========================================================================================

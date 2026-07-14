@@ -1,0 +1,188 @@
+========================================================================================
+<<<<<Name>>>>> TensorFlow <<<<</Name>>>>>
+========================================================================================
+<<<<<Small Description>>>>> GPU-Accelerated TensorFlow Environment with RAPIDS and Horovod for Distributed Training <<<<</Small Description>>>>>
+========================================================================================
+<<<<<Description>>>>> This container provides a full GPU-accelerated TensorFlow environment for training, evaluation, and inference. It ships with Horovod for multi-GPU and multi-node distributed training, the RAPIDS suite for GPU-accelerated data science, and a Jupyter-based development environment. No project code is baked in — mount your own code and data at run time. The container runs on GPU or falls back to CPU-only execution.
+
+Key Features:
+- TensorFlow with CUDA support for GPU-accelerated training and inference
+- Horovod for single-node multi-GPU and multi-node distributed training
+- RAPIDS GPU-accelerated data science stack (cuDF, cuML, cuGraph, Dask-CUDA)
+- JAX included for additional accelerated numerical computing
+- Essential data science stack (NumPy, Pandas, SciPy, scikit-learn, XGBoost)
+- Visualization and experiment tracking (Matplotlib, TensorBoard)
+- Development environment (JupyterLab, IPython) with combined Jupyter+TensorBoard mode
+- Runs on GPU or CPU, with built-in multi-node Slurm support <<<<</Description>>>>>
+========================================================================================
+<<<<<Image Version>>>>> NGC 24.08 <<<<</Image Version>>>>>
+========================================================================================
+<<<<<Publisher>>>>> NVIDIA NGC <<<<</Publisher>>>>>
+========================================================================================
+<<<<<Modified>>>>> <TBD> <<<<</Modified>>>>>
+========================================================================================
+<<<<<Compressed Size>>>>> <TBD> <<<<</Compressed Size>>>>>
+========================================================================================
+<<<<<Multinode Support>>>>> Yes <<<<</Multinode Support>>>>>
+========================================================================================
+<<<<<Multi-Arch Support>>>>> Yes (Linux x86_64) <<<<</Multi-Arch Support>>>>>
+========================================================================================
+
+
+<<<<<System requirements>>>>> Before running this container, ensure your system meets the following requirements.
+
+        Apptainer / Singularity runtime
+        Linux x86_64 architecture
+
+        NVIDIA GPU with CUDA support (optional, CPU fallback available)
+        AMD GPU with ROCm support also usable via --rocm
+        CUDA-compatible GPU driver (if using GPU acceleration)
+
+        Minimum 4GB RAM (8GB+ recommended for deep learning)
+        Minimum 10GB free disk space for container and cache
+
+<<<<</System requirements>>>>>
+========================================================================================
+<<<<<Included Packages>>>>> The container ships with a deep learning and GPU-accelerated data science stack pre-installed, so most workflows work out of the box with no extra setup. This is a representative list of the core packages present across builds of this container family, not the full install — run a shell inside the container and use `pip list` to see everything actually installed in a given build.
+
+        Core Framework
+        --------------------------------
+        tensorflow, keras, tf_keras, horovod, jax
+
+        GPU-Accelerated Data Science (RAPIDS)
+        --------------------------------
+        cudf, cuml, cugraph, dask-cuda
+
+        Data Science & Visualization
+        --------------------------------
+        numpy, pandas, scipy, scikit-learn, matplotlib, xgboost
+
+        Development & Notebooks
+        --------------------------------
+        jupyterlab, tensorboard, ipython
+
+<<<<</Included Packages>>>>>
+========================================================================================
+<<<<<Directory Structure>>>>> These paths exist inside the container, empty by default — bind your own folders onto them so the container can read your files and write results back out:
+
+        /code            your training/eval scripts
+        /data            your input datasets
+        /output          checkpoints and logs get written here
+        /model           pretrained weights, if you have any
+        /scratch         node-local scratch space (temp files, not kept)
+
+        Also automatically available, no --bind needed:
+        $HOME            your normal home directory
+        /tmp             temp space
+
+<<<<</Directory Structure>>>>>
+========================================================================================
+<<<<<Basic Flags>>>>> A handful of flags cover almost everything you'll need day to day:
+
+        --nv                  Give the container access to your NVIDIA GPU(s).
+                              Use it any time you're doing GPU work.
+
+        --rocm                Same idea as --nv, but for AMD GPUs. Use it
+                              instead of --nv on ROCm-based systems.
+
+        --bind src:dst        Make a folder on your machine visible inside the
+                              container at path dst. This is how the container
+                              sees your code, data, and writes results back out.
+                              Repeat the flag to bind more than one folder:
+                                --bind /my/code:/code --bind /my/data:/data
+
+        --env KEY=VALUE       Set an environment variable inside the container
+                              for this run only, e.g. --env CUDA_VISIBLE_DEVICES=0
+
+        (For the full list of options, see: apptainer help exec)
+
+<<<<</Basic Flags>>>>>
+========================================================================================
+<<<<<Modes>>>>> There are four ways to use this container: run it plainly, exec a specific command, shell in interactively, or launch it as a background instance.
+
+        RUN — start a built-in mode
+        --------------------------------
+        Launches a pre-built mode that ships with the container (jupyter,
+        tensorboard, or jupyter+tensorboard). You don't point it at a script —
+        you just pick the mode and it starts. The mode name goes at the end
+        of the command. Running with no mode uses the default (jupyter).
+
+          apptainer run --nv --bind /my/code:/code container.sif <mode>
+
+          # JupyterLab only
+          apptainer run --nv --bind /my/code:/code container.sif jupyter
+
+          # TensorBoard only, pointed at /output
+          apptainer run --nv --bind /my/output:/output container.sif tensorboard
+
+          # Both together (TensorBoard in background, Jupyter in foreground)
+          apptainer run --nv --bind /my/code:/code --bind /my/output:/output \
+            container.sif jupyter+tensorboard
+
+        EXEC — run your own commands and scripts
+        --------------------------------
+        Runs a single command, or one of your own scripts (like train.py),
+        inside the container. This is how you do actual work — bind in your
+        code and data, set any env vars you need, and point exec at what to run.
+
+          apptainer exec --nv --bind /my/code:/code --bind /my/data:/data \
+            --bind /my/output:/output container.sif python /code/train.py
+
+          # Multiple GPUs on one node (Horovod)
+          apptainer exec --nv --bind /my/code:/code --bind /my/data:/data \
+            container.sif horovodrun -np 4 python /code/train.py
+
+          # Jupyter Lab, reachable via SSH tunnel
+          apptainer run --nv --bind /my/code:/code container.sif jupyter
+          # then from your laptop:
+          ssh -L 8888:<compute-node>:8888 <you>@<login-node>
+          # open http://localhost:8888
+
+        SHELL — drop into an interactive prompt
+        --------------------------------
+        Starts an interactive shell inside the container. No command runs
+        automatically — useful for inspecting the environment, checking
+        installed packages, or running things manually.
+
+          apptainer shell --nv --bind /my/code:/code container.sif
+          # Type `exit` to leave.
+
+        INSTANCE — run the container as a persistent background service
+        --------------------------------
+        Starts the container detached, so it keeps running (e.g. a long
+        training job or a Jupyter/TensorBoard server) after you disconnect.
+
+          apptainer instance start --nv --bind /my/code:/code \
+            container.sif tf-job
+
+          apptainer exec instance://tf-job python /code/train.py
+
+          apptainer instance list
+          apptainer instance stop tf-job
+
+<<<<</Modes>>>>>
+========================================================================================
+<<<<<Installing Extra Packages>>>>> You can `pip install` something new right inside a running container — it will work for that session. But the container filesystem resets on every fresh run, so anything you installed is gone next time, unless you use an overlay:
+
+        apptainer overlay create --size 1024 overlay.img
+        apptainer shell --nv --overlay overlay.img --bind /my/code:/code container.sif
+        pip install <package>
+
+        Reuse the same overlay.img next time to see the package again.
+
+<<<<</Installing Extra Packages>>>>>
+========================================================================================
+<<<<<More Help & Testing>>>>> For the full list of built-in modes, flags, and usage details:
+
+        apptainer run-help container.sif
+
+To check that the container is intact and working:
+
+        apptainer test container.sif
+
+To also confirm the GPU is being picked up correctly, add --nv:
+
+        apptainer test --nv container.sif
+
+<<<<</More Help & Testing>>>>>
+========================================================================================

@@ -1,0 +1,141 @@
+========================================================================================
+<<<<<version id>>>>> 1.0 <<<<</version id>>>>>
+========================================================================================
+<<<<<datetime>>>>> 2026-07-08 <<<<</datetime>>>>>
+========================================================================================
+<<<<<size>>>>> <TBD> <<<<</size>>>>>
+========================================================================================
+========================================================================================
+<<<<<How to Run>>>>>
+
+  ================================================================================
+    QUICK START
+  ================================================================================
+    apptainer run --nv container.sif
+
+  (--nv gives access to the GPU. JupyterLab and shell also work without one.)
+
+
+  ================================================================================
+    MODES & FLAGS
+  ================================================================================
+    MODES
+    --------------------------------------------------------------------------
+      jupyter (default)     JupyterLab + dask-labextension dashboard
+        apptainer run --nv --bind /my/code:/code --bind /my/data:/data \
+          container.sif jupyter
+
+      dask-scheduler         Dask scheduler
+        apptainer run --nv container.sif dask-scheduler
+
+      dask-worker             GPU dask-cuda worker, pointed at a scheduler
+        apptainer run --nv \
+          --env DASK_SCHEDULER_ADDRESS=tcp://<scheduler-host>:8786 \
+          --env DASK_PROTOCOL=tcp \
+          container.sif dask-worker
+
+    FLAGS
+    --------------------------------------------------------------------------
+      --nv                --nv        (NVIDIA GPUs)
+      --rocm              --rocm      (AMD GPUs, instead of --nv)
+      --bind src:dst      --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output
+      --env KEY=VALUE     --env CUDA_VISIBLE_DEVICES=0
+
+    Directories to bind: /code /data /output /model /scratch
+
+
+  ================================================================================
+    RUN YOUR OWN SCRIPT (EXEC)
+  ================================================================================
+    apptainer exec --nv \
+      --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+      container.sif python /code/train.py
+
+    # Pick a specific GPU
+    apptainer exec --nv --env CUDA_VISIBLE_DEVICES=0 \
+      --bind /my/code:/code container.sif python /code/script.py
+
+
+  ================================================================================
+    SLURM — SINGLE NODE
+  ================================================================================
+    #!/bin/bash
+    #SBATCH --job-name=rapids-job
+    #SBATCH --gres=gpu:2
+    #SBATCH --cpus-per-task=16
+    #SBATCH --partition=gpu
+    #SBATCH --output=./logs/logs_%j.out
+    #SBATCH --error=./logs/logs_%j.err
+    #SBATCH --time=02:00:00
+
+    echo "===================================="
+    echo "Job Name   : $SLURM_JOB_NAME"
+    echo "GPUs       : $SLURM_GPUS_ON_NODE"
+    echo "===================================="
+
+    srun apptainer exec --nv \
+      --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+      container.sif python /code/script.py
+
+    echo "===================================="
+    echo "Job Completed"
+    echo "===================================="
+
+
+  ================================================================================
+    SLURM — MULTI-NODE  (dask-cuda cluster: scheduler on node 0, worker on
+                         every node — house-style logs/echo banners added)
+  ================================================================================
+    #!/bin/bash
+    #SBATCH --job-name=rapids-dask
+    #SBATCH --nodes=4
+    #SBATCH --gres=gpu:4
+    #SBATCH --ntasks-per-node=1
+    #SBATCH --cpus-per-task=32
+    #SBATCH --output=./logs/logs_%j.out
+    #SBATCH --error=./logs/logs_%j.err
+    #SBATCH --time=04:00:00
+
+    NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+    SCHED_NODE=$(echo "$NODES" | head -n1)
+    SCHED_ADDR="tcp://${SCHED_NODE}:8786"
+
+    echo "===================================="
+    echo "Job Name    : $SLURM_JOB_NAME"
+    echo "Nodes       : $SLURM_NNODES"
+    echo "Sched Node  : $SCHED_NODE"
+    echo "Sched Addr  : $SCHED_ADDR"
+    echo "===================================="
+
+    # 1. Start the scheduler on node 0 only
+    srun --nodes=1 --ntasks=1 -w "$SCHED_NODE" \
+      apptainer exec --nv container.sif dask scheduler \
+      --host 0.0.0.0 --port 8786 &
+
+    sleep 10   # give the scheduler a moment to come up
+
+    # 2. Start a dask-cuda-worker on every node (scheduler node included)
+    srun apptainer exec --nv \
+      --bind /my/code:/code --bind /my/data:/data --bind /my/output:/output \
+      --env DASK_SCHEDULER_ADDRESS="$SCHED_ADDR" \
+      --env DASK_PROTOCOL=ucx \
+      container.sif dask-worker
+
+    wait
+
+    echo "===================================="
+    echo "Job Completed"
+    echo "===================================="
+
+    Use --env DASK_PROTOCOL=ucx on InfiniBand partitions (RDMA transport),
+    DASK_PROTOCOL=tcp (default) on Ethernet-only partitions. Pin a specific
+    HCA with --env UCX_NET_DEVICES=mlx5_0:1 if needed.
+
+
+  ================================================================================
+    CHECKING IT WORKS
+  ================================================================================
+    apptainer test --nv container.sif
+
+<<<<</How to Run>>>>>
+========================================================================================

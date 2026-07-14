@@ -1,0 +1,192 @@
+========================================================================================
+<<<<<Name>>>>> vLLM <<<<</Name>>>>>
+========================================================================================
+<<<<<Small Description>>>>> OpenAI-Compatible LLM Inference Server with Single-Node and Multi-Node Serving <<<<</Small Description>>>>>
+========================================================================================
+<<<<<Description>>>>> This container packages vLLM as a ready-to-run, OpenAI-compatible inference server for serving large language models. It supports single-node serving with tensor parallelism across the GPUs on one machine, as well as multi-node serving with pipeline parallelism coordinated over a Ray cluster. No model is baked into the image — bind your own local weights or point the container at a Hugging Face repo id and let it download and cache the model on first run.
+
+Key Features:
+- OpenAI-compatible REST API server for LLM inference
+- Tensor-parallel serving across multiple GPUs on a single node
+- Pipeline-parallel multi-node serving via a Ray cluster
+- Flexible model sourcing: local flat directory, existing Hugging Face cache, or fresh download from the Hub
+- Gated model support via Hugging Face token
+- CUDA and NCCL support bundled in, tuned for InfiniBand or Ethernet fabrics
+- Pass-through support for any additional vLLM server flags <<<<</Description>>>>>
+========================================================================================
+<<<<<Image Version>>>>> 0.24.0 <<<<</Image Version>>>>>
+========================================================================================
+<<<<<Publisher>>>>> CDAC <<<<</Publisher>>>>>
+========================================================================================
+<<<<<Modified>>>>> July 10, 2026 <<<<</Modified>>>>>
+========================================================================================
+<<<<<Compressed Size>>>>> <TBD> <<<<</Compressed Size>>>>>
+========================================================================================
+<<<<<Multinode Support>>>>> Yes (pipeline-parallel serving across nodes via Ray) <<<<</Multinode Support>>>>>
+========================================================================================
+<<<<<Multi-Arch Support>>>>> Yes (Linux x86_64) <<<<</Multi-Arch Support>>>>>
+========================================================================================
+
+
+<<<<<System requirements>>>>> Before running this container, ensure your system meets the following requirements.
+
+        Apptainer / Singularity runtime
+        Linux x86_64 architecture
+
+        NVIDIA GPU with CUDA support (required for practical serving; a
+        CPU-only node will only pass the container's basic import check)
+        NVIDIA Container Toolkit for GPU access
+        CUDA-compatible GPU driver
+
+        RAM and disk requirements scale with the model being served — plan
+        for enough free disk space to hold the model weights (and the
+        Hugging Face cache, if downloading), and enough RAM/VRAM headroom
+        for the chosen tensor-parallel configuration
+
+        For multi-node serving: a fast interconnect (InfiniBand recommended,
+        Ethernet supported) between nodes participating in the Ray cluster
+
+<<<<</System requirements>>>>>
+========================================================================================
+<<<<<Included Packages>>>>> The container ships with a complete LLM inference stack pre-installed, so serving works out of the box with no extra setup. This is a representative list of the core packages present across builds of this container family, not the full install — run a shell inside the container and use `pip list` to see everything actually installed in a given build.
+
+        Core Inference Stack
+        --------------------------------
+        vllm, torch, torchvision, torchaudio, ray
+
+        Model & Tokenization
+        --------------------------------
+        transformers, tokenizers, huggingface_hub, safetensors,
+        sentencepiece, accelerate
+
+        API Server
+        --------------------------------
+        fastapi, uvicorn, pydantic, openai
+
+        Supporting Libraries
+        --------------------------------
+        numpy, bitsandbytes, opencv-python-headless
+
+<<<<</Included Packages>>>>>
+========================================================================================
+<<<<<Directory Structure>>>>> These paths exist inside the container — bind your own folders onto them so the container can read your model weights and use scratch space:
+
+        /model           model weights (bind your own) + hf-cache/ for
+                         auto-downloaded Hugging Face Hub models
+        /scratch         node-local scratch space (temp files, not kept)
+        /code            not used by this container (reserved, house convention)
+        /data            not used by this container (reserved, house convention)
+        /output          not used by this container (reserved, house convention)
+
+        Also automatically available, no --bind needed:
+        $HOME            your normal home directory
+        /tmp             temp space
+
+<<<<</Directory Structure>>>>>
+========================================================================================
+<<<<<Basic Flags>>>>> A handful of flags cover almost everything you'll need day to day:
+
+        --nv                  Give the container access to your NVIDIA GPU(s).
+                              Required for serving; without it, only the
+                              container's basic import check will pass.
+
+        --bind src:dst        Make a folder on your machine visible inside the
+                              container at path dst. Bind your model weights,
+                              or an empty folder to let vLLM download into it:
+                                --bind /my/models:/model
+
+        --env KEY=VALUE       Set an environment variable inside the container
+                              for this run only, e.g. to pick a model:
+                                --env MODEL=meta-llama/Llama-3.1-8B-Instruct
+                              or supply a token for gated models:
+                                --env HF_TOKEN=<token>
+
+        (For the full list of options, see: apptainer help exec)
+
+<<<<</Basic Flags>>>>>
+========================================================================================
+<<<<<Modes>>>>> There are four ways to use this container: run it plainly to start the server, exec a specific command, shell in interactively, or launch it as a background instance.
+
+        RUN — start the inference server
+        --------------------------------
+        Launches the OpenAI-compatible API server, serving whatever MODEL
+        points at. The mode name goes at the end of the command; running
+        with no mode at all uses the default (serve).
+
+          # Model already in your local Hugging Face cache
+          apptainer run --nv \
+            --env MODEL=Qwen/Qwen3.5-4B \
+            --bind ~/.cache/huggingface:/model/hf-cache \
+            container.sif serve
+
+          # Model files in their own flat local directory
+          apptainer run --nv \
+            --bind /my/models/Qwen3.5-4B:/model \
+            container.sif serve
+
+          # Model not downloaded yet — vLLM downloads on first run
+          apptainer run --nv \
+            --env MODEL=Qwen/Qwen3.5-4B \
+            --bind /my/models:/model/hf-cache \
+            container.sif serve
+
+          # Extra vLLM flags pass straight through after `serve`
+          apptainer run --nv --bind /my/models:/model container.sif serve \
+            --max-model-len 8192 --gpu-memory-utilization 0.9
+
+        EXEC — run your own commands
+        --------------------------------
+        Runs a one-off command inside the container, e.g. to check GPU
+        visibility or inspect the environment.
+
+          apptainer exec --nv container.sif nvidia-smi
+          apptainer exec --nv container.sif python -c "import torch; print(torch.cuda.device_count())"
+
+        SHELL — drop into an interactive prompt
+        --------------------------------
+        Starts an interactive shell inside the container. No command runs
+        automatically — useful for inspecting the environment or installed
+        packages.
+
+          apptainer shell --nv --bind /my/models:/model container.sif
+          # Type `exit` to leave.
+
+        INSTANCE — run the container as a persistent background service
+        --------------------------------
+        Starts the container detached, so the inference server keeps
+        running after you disconnect.
+
+          apptainer instance start --nv --bind /my/models:/model \
+            container.sif vllm-job
+
+          apptainer exec instance://vllm-job curl localhost:8000/v1/models
+
+          apptainer instance list
+          apptainer instance stop vllm-job
+
+<<<<</Modes>>>>>
+========================================================================================
+<<<<<Installing Extra Packages>>>>> You can `pip install` something new right inside a running container — it will work for that session. But the container filesystem resets on every fresh run, so anything you installed is gone next time, unless you use an overlay:
+
+        apptainer overlay create --size 1024 overlay.img
+        apptainer shell --nv --overlay overlay.img --bind /my/models:/model container.sif
+        pip install <package>
+
+        Reuse the same overlay.img next time to see the package again.
+
+<<<<</Installing Extra Packages>>>>>
+========================================================================================
+<<<<<More Help & Testing>>>>> For the full list of built-in modes, flags, and usage details:
+
+        apptainer run-help container.sif
+
+To check that the container is intact and working:
+
+        apptainer test container.sif
+
+To also confirm the GPU is being picked up correctly, add --nv:
+
+        apptainer test --nv container.sif
+
+<<<<</More Help & Testing>>>>>
+========================================================================================
